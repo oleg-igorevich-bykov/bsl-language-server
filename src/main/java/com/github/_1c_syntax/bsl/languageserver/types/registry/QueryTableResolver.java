@@ -141,7 +141,7 @@ public class QueryTableResolver {
     if (mdo == null) {
       return isNamedByReference(tableName) ? TableLookup.UNKNOWN_OBJECT : TableLookup.UNRESOLVED;
     }
-    var fields = resolve(tableName, null);
+    var fields = resolve(tableName, configuration, mdo, null);
     var tail = tailSegment(tableName);
     var tabularSections = tabularSectionNames(mdo);
     if (!fields.isEmpty()) {
@@ -184,11 +184,21 @@ public class QueryTableResolver {
   }
 
   private List<MemberDescriptor> resolve(String tableName, @Nullable FormDynamicListAttribute list) {
-    var match = platformTables.find(tableName);
     var configuration = currentConfiguration();
+    return resolve(tableName, configuration, findMdo(tableName, configuration), list);
+  }
+
+  /**
+   * Поля таблицы по уже найденным конфигурации и объекту метаданных — вариант для вызывающих,
+   * которым тот же объект нужен и для другой цели ({@link #lookup(String)}), чтобы не искать
+   * его в конфигурации второй раз.
+   */
+  private List<MemberDescriptor> resolve(String tableName, @Nullable CF configuration, @Nullable MD mdo,
+                                         @Nullable FormDynamicListAttribute list) {
+    var match = platformTables.find(tableName);
     var request = new QueryTableRequest(
       tableName,
-      findMdo(tableName, configuration),
+      mdo,
       configuration,
       match == null ? null : match.table(),
       match == null ? Map.of() : match.nameBindings(),

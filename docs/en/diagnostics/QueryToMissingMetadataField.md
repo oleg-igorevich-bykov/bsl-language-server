@@ -31,8 +31,10 @@ With an empty configuration the diagnostic checks nothing.
 
 ### Limits
 
-- The MCP tool `analyze_file` picks up changes to metadata files of the working copy without restarting the server.
-  In LSP mode the configuration is re-read only when the server is restarted.
+- Changes to metadata files of the working copy are picked up without restarting the server, both via MCP
+  (`analyze_file`) and in LSP mode. Walking the metadata tree is not free (about 1.4 s on a BSP export), so it is
+  checked no more often than every few seconds: an edit made right before the next analysis may become visible
+  with that delay rather than instantly.
 - Types registered from the configuration (hints, `hover`) stay as they were after the metadata is re-read until
   the server is restarted; this does not affect this diagnostic.
 - Extension objects and attributes are taken into account the same way the main server configuration sees them.

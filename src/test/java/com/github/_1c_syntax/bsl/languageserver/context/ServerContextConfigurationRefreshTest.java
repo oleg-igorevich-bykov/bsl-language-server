@@ -34,6 +34,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -99,6 +100,7 @@ class ServerContextConfigurationRefreshTest extends AbstractServerContextAwareTe
 
     // when
     replaceInFile(CATALOG_FILE, "<Name>Реквизит3</Name>", "<Name>ТестовыйРеквизит</Name>");
+    awaitRefreshWindow();
     var refreshed = context.refreshConfigurationIfStale();
 
     // then
@@ -117,11 +119,31 @@ class ServerContextConfigurationRefreshTest extends AbstractServerContextAwareTe
     replaceInFile("Configuration.xml",
       "<Catalog>СправочникБезГрупп</Catalog>",
       "<Catalog>СправочникБезГрупп</Catalog>\n\t\t\t<Catalog>НовыйСправочник</Catalog>");
+    awaitRefreshWindow();
     var refreshed = context.refreshConfigurationIfStale();
 
     // then
     assertThat(refreshed).isTrue();
     assertThat(findCatalog("НовыйСправочник")).isTrue();
+  }
+
+  /**
+   * Ждёт истечения {@link ServerContext#REFRESH_CHECK_INTERVAL_NANOS} с момента последнего
+   * чтения конфигурации в {@link #copyFixture()}: обход дерева метаданных — не бесплатная
+   * операция (на выгрузке БСП ~1.4 с), поэтому {@code refreshConfigurationIfStale()} не
+   * повторяет его чаще этого интервала (см. его javadoc). Правка, сделанная сразу после
+   * чтения конфигурации, становится видна только по истечении этого окна — тест воспроизводит
+   * реальную задержку, а не обходит её.
+   */
+  private static void awaitRefreshWindow() {
+    var margin = TimeUnit.MILLISECONDS.toNanos(200);
+    var millis = TimeUnit.NANOSECONDS.toMillis(ServerContext.REFRESH_CHECK_INTERVAL_NANOS + margin);
+    try {
+      Thread.sleep(millis);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IllegalStateException("Interrupted while awaiting the refresh window", e);
+    }
   }
 
   @Test

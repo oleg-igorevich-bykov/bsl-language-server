@@ -61,6 +61,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -111,6 +112,12 @@ public class ServerContext {
   private final Object configurationRefreshLock = new Object();
   /** Отпечаток файлов метаданных на момент чтения {@link #configurationMetadata}. */
   private volatile long configurationFingerprint;
+  /** Не чаще какого интервала {@link #refreshConfigurationIfStale()} обходит файлы метаданных. */
+  // Package-private, а не private: тест того же пакета сверяется с этим значением, а не
+  // дублирует его вторым числом, которое могло бы разойтись с боевым.
+  static final long REFRESH_CHECK_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(2);
+  /** {@code System.nanoTime()} последней проверки отпечатка; {@code 0} — проверок ещё не было. */
+  private volatile long lastFingerprintCheckNanos;
   @Nullable
   @Setter
   @Getter
@@ -491,6 +498,15 @@ public class ServerContext {
    * <p>
    * Перечитывается только сама конфигурация и кэш общих модулей. Уже зарегистрированные
    * по ней типы ({@code TypeRegistry}) остаются прежними до перезапуска сервера.
+   * <p>
+   * Сам отпечаток — обход всех файлов метаданных — не бесплатен (на выгрузке БСП 3.1.12,
+   * ~15 тысяч файлов метаданных, обход занимает ~1.4 с), а спрашивают об устаревании на каждый
+   * расчёт диагностик (см. {@code DefaultDiagnosticComputer}), то есть потенциально на каждое
+   * открытие/изменение документа в LSP-сессии. Поэтому обход происходит не чаще, чем раз в
+   * {@link #REFRESH_CHECK_INTERVAL_NANOS}: до истечения интервала метод возвращает {@code false}
+   * по одному дешёвому сравнению volatile-поля, без захвата {@link #configurationRefreshLock}.
+   * Правка, попавшая в это окно, будет видна при следующей проверке после его истечения — то есть
+   * с задержкой до интервала, а не немедленно.
    *
    * @return {@code true}, если конфигурация была перечитана.
    */
@@ -499,11 +515,21 @@ public class ServerContext {
     if (root == null) {
       return false;
     }
+    if (System.nanoTime() - lastFingerprintCheckNanos < REFRESH_CHECK_INTERVAL_NANOS) {
+      return false;
+    }
     synchronized (configurationRefreshLock) {
-      if (!configurationMetadata.isPresent()) {
+      if (System.nanoTime() - lastFingerprintCheckNanos < REFRESH_CHECK_INTERVAL_NANOS) {
+        // Другой поток уже проверил, пока этот ждал лок.
         return false;
       }
-      if (MetadataFingerprint.of(root) == configurationFingerprint) {
+      if (!configurationMetadata.isPresent()) {
+        lastFingerprintCheckNanos = System.nanoTime();
+        return false;
+      }
+      var fingerprint = MetadataFingerprint.of(root);
+      lastFingerprintCheckNanos = System.nanoTime();
+      if (fingerprint == configurationFingerprint) {
         return false;
       }
       LOGGER.info("Файлы метаданных изменились, конфигурация перечитывается: {}", root);
@@ -578,6 +604,9 @@ public class ServerContext {
     // Отпечаток снимается до чтения: правка, попавшая во время чтения, при следующей
     // проверке даст расхождение и перечитает конфигурацию ещё раз.
     configurationFingerprint = MetadataFingerprint.of(configurationRoot);
+    // Отсюда отсчитывается интервал следующей проверки: отпечаток только снят, повторный
+    // обход того же дерева файлов немедленно после этого ничего нового не даст.
+    lastFingerprintCheckNanos = System.nanoTime();
 
     var progress = workDoneProgressHelper.createProgress(0, "");
     progress.beginProgress(getMessage("computeConfigurationMetadata"));

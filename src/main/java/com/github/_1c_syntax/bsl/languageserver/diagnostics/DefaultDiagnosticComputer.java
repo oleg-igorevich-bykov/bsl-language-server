@@ -60,6 +60,13 @@ public abstract class DefaultDiagnosticComputer implements DiagnosticComputer {
 
   @Override
   public List<Diagnostic> compute(DocumentContext documentContext) {
+    // Метаданные рабочей копии могли измениться на диске (правка реквизита, новый объект) с тех
+    // пор, как конфигурация была прочитана, — диагностики, читающие её (QueryToMissingMetadata*),
+    // должны увидеть актуальный состав без перезапуска сервера. Проверка — единая точка для LSP,
+    // analyze и MCP, все они считают диагностики отсюда; throttling внутри метода не даёт обходу
+    // файлов метаданных стать хот-патом на каждое открытие/изменение документа.
+    documentContext.getServerContext().refreshConfigurationIfStale();
+
     // Сбор через Future.get() обычного пула, а не parallelStream() на ForkJoinPool с блокирующим
     // join(): блокировка на get() не проходит через ForkJoinPool.managedBlock, поэтому блокирующий
     // вызов из воркера ForkJoinPool не плодит компенсирующие потоки и живые DocumentContext.

@@ -95,13 +95,6 @@ public class McpDocumentReader {
         "File is not part of any registered workspace folder: " + path + ". "
           + McpWorkspaceFolders.registrationHint(serverContextProvider.getAllContexts().keySet())));
 
-    // Свежий AST нужен диагностикам, а те сверяются с конфигурацией: метаданные могли измениться
-    // на диске (правка реквизита, новый объект) с тех пор, как она была прочитана. Проверка идёт
-    // до блокировок документа — перечитывание конфигурации под ними недопустимо.
-    if (requireFreshAst) {
-      serverContext.refreshConfigurationIfStale();
-    }
-
     var lock = serverContext.getDocumentLock(uri);
     var existing = serverContext.getDocument(uri);
 
