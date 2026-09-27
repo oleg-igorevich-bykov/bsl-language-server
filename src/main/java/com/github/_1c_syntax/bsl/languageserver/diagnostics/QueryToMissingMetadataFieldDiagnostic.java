@@ -22,6 +22,7 @@
 package com.github._1c_syntax.bsl.languageserver.diagnostics;
 
 import com.github._1c_syntax.bsl.languageserver.configuration.Language;
+import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
 import com.github._1c_syntax.bsl.languageserver.diagnostics.metadata.DiagnosticMetadata;
 import com.github._1c_syntax.bsl.languageserver.diagnostics.metadata.DiagnosticScope;
 import com.github._1c_syntax.bsl.languageserver.diagnostics.metadata.DiagnosticSeverity;
@@ -31,10 +32,9 @@ import com.github._1c_syntax.bsl.languageserver.types.model.BilingualString;
 import com.github._1c_syntax.bsl.languageserver.types.registry.QueryFieldValidator;
 import com.github._1c_syntax.bsl.languageserver.types.registry.QueryFieldValidator.Problem;
 import com.github._1c_syntax.bsl.languageserver.utils.Trees;
-import com.github._1c_syntax.bsl.parser.SDBLParser;
 import com.github._1c_syntax.bsl.types.ConfigurationSource;
 import lombok.RequiredArgsConstructor;
-import org.antlr.v4.runtime.tree.ParseTree;
+import org.eclipse.lsp4j.Diagnostic;
 
 import java.util.Comparator;
 import java.util.List;
@@ -72,14 +72,24 @@ public class QueryToMissingMetadataFieldDiagnostic extends AbstractSDBLVisitorDi
 
   private final QueryFieldValidator validator;
 
+  // Свой обход, а не visitQueryPackage(): валидатору нужны не только AST, но и полный поток
+  // токенов запроса (распознаёт шаблонные плейсхолдеры вроде "?" — см. QueryFieldValidator),
+  // а стандартный визиторный проход AbstractSDBLVisitorDiagnostic токены не сохраняет.
   @Override
-  public ParseTree visitQueryPackage(SDBLParser.QueryPackageContext ctx) {
-    if (documentContext.getServerContext().getConfiguration().getConfigurationSource() == ConfigurationSource.EMPTY
-      || Trees.treeContainsErrors(ctx)) {
-      return ctx;
+  public List<Diagnostic> getDiagnostics(DocumentContext documentContext) {
+    this.documentContext = documentContext;
+    diagnosticStorage.clearDiagnostics();
+    if (documentContext.getServerContext().getConfiguration().getConfigurationSource()
+      == ConfigurationSource.EMPTY) {
+      return diagnosticStorage.getDiagnostics();
     }
-    validator.validate(ctx).forEach(this::report);
-    return ctx;
+    for (var tokenizer : documentContext.getQueries()) {
+      var ast = tokenizer.getAst();
+      if (ast != null && !Trees.treeContainsErrors(ast)) {
+        validator.validate(tokenizer).forEach(this::report);
+      }
+    }
+    return diagnosticStorage.getDiagnostics();
   }
 
   private void report(Problem problem) {

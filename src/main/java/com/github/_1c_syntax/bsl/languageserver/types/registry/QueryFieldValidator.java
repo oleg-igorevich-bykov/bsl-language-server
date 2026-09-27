@@ -24,7 +24,9 @@ package com.github._1c_syntax.bsl.languageserver.types.registry;
 import com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceScope;
 import com.github._1c_syntax.bsl.languageserver.types.model.BilingualString;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor;
+import com.github._1c_syntax.bsl.parser.SDBLLexer;
 import com.github._1c_syntax.bsl.parser.SDBLParser;
+import com.github._1c_syntax.bsl.parser.SDBLTokenizer;
 import lombok.RequiredArgsConstructor;
 import org.antlr.v4.runtime.ParserRuleContext;
 import org.antlr.v4.runtime.Token;
@@ -48,7 +50,9 @@ import java.util.Objects;
  * становится только то, что разрешается однозначно, — источник, известный по имени
  * объекта метаданных, и поле, которого нет в его составе. Всё остальное молчит: поля
  * временных таблиц, вложенных запросов и внешних источников, неизвестные псевдонимы,
- * обращения без псевдонима, порядок и итоги, таблицы, о полях которых резолвер не знает.
+ * обращения без псевдонима, порядок и итоги, таблицы, о полях которых резолвер не знает, а
+ * также имя, вплотную к которому стоит символ, не узнанный SDBL-лексером, — это шаблон
+ * запроса, собираемый подстановкой ({@code ТабличнаяЧасть?}), а не окончательный текст.
  * <p>
  * Псевдоним ищется от запроса, в котором стоит обращение, к объемлющим. Источник без
  * таблицы (подзапрос, временная таблица, параметр) псевдоним занимает, но полей у него
@@ -89,12 +93,13 @@ public class QueryFieldValidator {
   /**
    * Проверяет запросы пакета.
    *
-   * @param ast разобранный пакет запросов.
+   * @param tokenizer разобранный пакет запросов вместе с его токенами: токены нужны, чтобы
+   *                  отличить настоящее имя от шаблонного плейсхолдера (см. {@link Run#tokensByStart}).
    * @return найденные проблемы в порядке обхода дерева; пусто, если проверить нечего либо всё верно.
    */
-  public List<Problem> validate(SDBLParser.QueryPackageContext ast) {
-    var run = new Run();
-    run.visit(ast);
+  public List<Problem> validate(SDBLTokenizer tokenizer) {
+    var run = new Run(tokenizer.getTokens());
+    run.visit(tokenizer.getAst());
     return List.copyOf(run.problems);
   }
 
@@ -106,6 +111,26 @@ public class QueryFieldValidator {
     private final Map<String, QueryTableResolver.TableLookup> lookups = new HashMap<>();
     private final Deque<Map<String, @Nullable String>> scopes = new ArrayDeque<>();
     private final List<Problem> problems = new ArrayList<>();
+    /**
+     * Токены запроса по начальной позиции символа — для проверки соседства с
+     * {@link SDBLLexer#UNKNOWN}. Часть проекта конкатенацией: часть текста запроса, а
+     * настоящее имя таблицы или поля подставляется в шаблон позже, символом вроде {@code ?}
+     * или {@code %s}, который SDBL-лексер не узнаёт и отдаёт как {@code UNKNOWN}, не мешая
+     * разбору остального текста. Имя, вплотную к такому символу, не окончательное — по нему
+     * лучше промолчать, чем указать на несуществующее поле или таблицу, которых после
+     * подстановки не будет.
+     */
+    private final Map<Integer, Token> tokensByStart;
+    private final Map<Integer, Token> tokensByStop;
+
+    Run(List<Token> tokens) {
+      tokensByStart = new HashMap<>(tokens.size());
+      tokensByStop = new HashMap<>(tokens.size());
+      for (var token : tokens) {
+        tokensByStart.put(token.getStartIndex(), token);
+        tokensByStop.put(token.getStopIndex(), token);
+      }
+    }
 
     void visit(ParseTree node) {
       if (node instanceof SDBLParser.QueryContext query) {
@@ -207,7 +232,7 @@ public class QueryFieldValidator {
         return;
       }
       var thirdPart = thirdPartOf(dataSource);
-      if (thirdPart == null) {
+      if (thirdPart == null || isAdjacentToUnknownToken(thirdPart)) {
         return;
       }
       var tableName = QuerySources.tableNameOf(dataSource);
@@ -245,7 +270,8 @@ public class QueryFieldValidator {
 
     private void checkField(ParserRuleContext field, String tableName) {
       var lookup = lookup(tableName);
-      if (lookup.status() != QueryTableResolver.LookupStatus.FIELDS) {
+      if (lookup.status() != QueryTableResolver.LookupStatus.FIELDS
+        || isAdjacentToUnknownToken(field.getStart())) {
         return;
       }
       var name = field.getText();
@@ -259,6 +285,21 @@ public class QueryFieldValidator {
 
     private QueryTableResolver.TableLookup lookup(String tableName) {
       return lookups.computeIfAbsent(tableName, tableResolver::lookup);
+    }
+
+    /**
+     * Стоит ли вплотную к токену, с любой стороны без пробела, символ, которого SDBL-лексер
+     * не узнал ({@link SDBLLexer#UNKNOWN}) — верный признак шаблона запроса, собираемого
+     * подстановкой (типичный пример из практики: {@code ТабличнаяЧасть?} или {@code Поле?},
+     * где {@code ?} — плейсхолдер, заменяемый на настоящее имя до выполнения запроса).
+     */
+    private boolean isAdjacentToUnknownToken(Token token) {
+      return isUnknown(tokensByStop.get(token.getStartIndex() - 1))
+        || isUnknown(tokensByStart.get(token.getStopIndex() + 1));
+    }
+
+    private static boolean isUnknown(@Nullable Token token) {
+      return token != null && token.getType() == SDBLLexer.UNKNOWN;
     }
   }
 }
