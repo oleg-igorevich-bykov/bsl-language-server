@@ -404,6 +404,9 @@
                 "QueryToMissingMetadata": {
                     "$ref": "parameters-schema.json#/definitions/QueryToMissingMetadata"
                 },
+                "QueryToMissingMetadataField": {
+                    "$ref": "parameters-schema.json#/definitions/QueryToMissingMetadataField"
+                },
                 "RedundantAccessToObject": {
                     "$ref": "parameters-schema.json#/definitions/RedundantAccessToObject"
                 },

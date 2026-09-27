@@ -8,6 +8,10 @@ Also, errors can occur when you manually change queries, without checking with t
 
 When accessing non-existent metadata in a query, a runtime error will occur.
 
+The diagnostic checks only the table name (the metadata object kind and name); query fields,
+including virtual table fields, are checked by a separate diagnostic
+[QueryToMissingMetadataField](QueryToMissingMetadataField.md).
+
 ## Examples
 
 Query for an already deleted register:

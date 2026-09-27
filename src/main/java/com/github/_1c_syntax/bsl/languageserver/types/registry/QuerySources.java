@@ -96,7 +96,7 @@ final class QuerySources {
    * Пусто у источника, за которым таблицы нет: подзапроса, временной таблицы,
    * параметра.
    */
-  private static String tableNameOf(SDBLParser.DataSourceContext dataSource) {
+  static String tableNameOf(SDBLParser.DataSourceContext dataSource) {
     var external = dataSource.externalDataSourceTable();
     if (external != null) {
       // Имя такой таблицы разбирается отдельным правилом целиком

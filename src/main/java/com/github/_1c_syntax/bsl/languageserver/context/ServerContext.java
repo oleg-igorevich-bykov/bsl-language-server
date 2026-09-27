@@ -108,6 +108,9 @@ public class ServerContext {
 
   private final Map<URI, DocumentContext> documents = new ConcurrentHashMap<>();
   private final Lazy<Solution> configurationMetadata = new Lazy<>(this::computeConfigurationMetadata);
+  private final Object configurationRefreshLock = new Object();
+  /** Отпечаток файлов метаданных на момент чтения {@link #configurationMetadata}. */
+  private volatile long configurationFingerprint;
   @Nullable
   @Setter
   @Getter
@@ -477,6 +480,41 @@ public class ServerContext {
   }
 
   /**
+   * Перечитать конфигурацию, если файлы метаданных рабочей копии изменились с тех пор,
+   * как она была прочитана.
+   * <p>
+   * Сравнивается отпечаток файлов метаданных (см. {@link MetadataFingerprint}); текст
+   * модулей на него не влияет. Конфигурация, которая ещё не читалась, не трогается: её
+   * первое чтение и так будет свежим. При изменении конфигурация перечитывается сразу, в потоке
+   * вызывающего, а не лениво из первого, кто её спросит: чтение конфигурации не должно
+   * случаться под блокировками документов.
+   * <p>
+   * Перечитывается только сама конфигурация и кэш общих модулей. Уже зарегистрированные
+   * по ней типы ({@code TypeRegistry}) остаются прежними до перезапуска сервера.
+   *
+   * @return {@code true}, если конфигурация была перечитана.
+   */
+  public boolean refreshConfigurationIfStale() {
+    var root = configurationRoot;
+    if (root == null) {
+      return false;
+    }
+    synchronized (configurationRefreshLock) {
+      if (!configurationMetadata.isPresent()) {
+        return false;
+      }
+      if (MetadataFingerprint.of(root) == configurationFingerprint) {
+        return false;
+      }
+      LOGGER.info("Файлы метаданных изменились, конфигурация перечитывается: {}", root);
+      commonModuleCache.invalidateAll();
+      configurationMetadata.clear();
+      configurationMetadata.getOrCompute();
+      return true;
+    }
+  }
+
+  /**
    * Язык исходников проекта: для конфигурации с заданным {@code ScriptVariant} — именно он
    * (русский/английский); для проекта без mdclasses-конфы и при нераспознанном варианте —
    * {@link LanguageServerConfiguration#getLanguage()}.
@@ -536,6 +574,10 @@ public class ServerContext {
     if (configurationRoot == null) {
       return Solution.EMPTY;
     }
+
+    // Отпечаток снимается до чтения: правка, попавшая во время чтения, при следующей
+    // проверке даст расхождение и перечитает конфигурацию ещё раз.
+    configurationFingerprint = MetadataFingerprint.of(configurationRoot);
 
     var progress = workDoneProgressHelper.createProgress(0, "");
     progress.beginProgress(getMessage("computeConfigurationMetadata"));

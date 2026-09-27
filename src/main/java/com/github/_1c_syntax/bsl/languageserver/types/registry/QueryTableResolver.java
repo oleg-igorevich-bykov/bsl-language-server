@@ -27,6 +27,7 @@ import com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceScope;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor;
 import com.github._1c_syntax.bsl.mdclasses.CF;
 import com.github._1c_syntax.bsl.mdo.MD;
+import com.github._1c_syntax.bsl.mdo.TabularSectionOwner;
 import com.github._1c_syntax.bsl.mdo.storage.form.FormDynamicListAttribute;
 import com.github._1c_syntax.bsl.types.MDOType;
 import com.github._1c_syntax.bsl.types.MdoReference;
@@ -82,6 +83,104 @@ public class QueryTableResolver {
    */
   public List<MemberDescriptor> fields(String tableName, FormDynamicListAttribute list) {
     return resolve(tableName, list);
+  }
+
+  /**
+   * Что известно о таблице запроса и о её полях.
+   *
+   * @param status          исход поиска.
+   * @param fields          поля таблицы; непусто только при {@link LookupStatus#FIELDS}.
+   * @param tabularSections имена табличных частей объекта таблицы; непусто только
+   *                        при {@link LookupStatus#FIELDS}. В запросе табличная часть
+   *                        полем не бывает, но и ошибкой её имя не считается.
+   */
+  public record TableLookup(LookupStatus status, List<MemberDescriptor> fields, List<String> tabularSections) {
+
+    private static final TableLookup UNRESOLVED = new TableLookup(LookupStatus.UNRESOLVED, List.of(), List.of());
+    private static final TableLookup UNKNOWN_OBJECT = new TableLookup(LookupStatus.UNKNOWN_OBJECT, List.of(), List.of());
+    private static final TableLookup UNKNOWN_TABLE = new TableLookup(LookupStatus.UNKNOWN_TABLE, List.of(), List.of());
+  }
+
+  /**
+   * Исход поиска таблицы запроса.
+   */
+  public enum LookupStatus {
+    /** Поля таблицы известны. */
+    FIELDS,
+    /** Объекта метаданных с таким именем в конфигурации нет. */
+    UNKNOWN_OBJECT,
+    /**
+     * Объект есть, но третья часть имени — не табличная часть объекта и не виртуальная
+     * таблица, которую знает платформа.
+     */
+    UNKNOWN_TABLE,
+    /**
+     * О таблице нечего сказать: конфигурация не прочитана либо пуста, либо у таблицы,
+     * которая существует, полей резолвер не знает (например, у табличной части).
+     */
+    UNRESOLVED
+  }
+
+  /**
+   * Ищет таблицу запроса в конфигурации и отвечает, можно ли по ней судить о полях.
+   * <p>
+   * Объект, которого в конфигурации нет, полей не имеет, хотя платформенные псевдополя
+   * ({@code Ссылка}, {@code Представление}) у таблицы с таким именем названы по шаблону, —
+   * поэтому его отличают от таблицы, у которой поля просто неизвестны.
+   *
+   * @param tableName имя таблицы, как его задаёт запрос ({@code Справочник.Номенклатура},
+   *                  {@code РегистрНакопления.Продажи.Остатки}).
+   * @return исход поиска и, если поля известны, сами поля.
+   */
+  public TableLookup lookup(String tableName) {
+    var configuration = currentConfiguration();
+    if (configuration == null) {
+      return TableLookup.UNRESOLVED;
+    }
+    var mdo = findMdo(tableName, configuration);
+    if (mdo == null) {
+      return isNamedByReference(tableName) ? TableLookup.UNKNOWN_OBJECT : TableLookup.UNRESOLVED;
+    }
+    var fields = resolve(tableName, null);
+    var tail = tailSegment(tableName);
+    var tabularSections = tabularSectionNames(mdo);
+    if (!fields.isEmpty()) {
+      return new TableLookup(LookupStatus.FIELDS, fields, tabularSections);
+    }
+    if (tail == null || isTabularSection(tabularSections, tail)) {
+      return TableLookup.UNRESOLVED;
+    }
+    return platformTables.find(tableName) == null ? TableLookup.UNKNOWN_TABLE : TableLookup.UNRESOLVED;
+  }
+
+  /**
+   * Названа ли таблица ссылкой на объект метаданных целиком — парами «вид.имя».
+   * Отличает имя, которое не нашлось в конфигурации, от имени, которое разобрать нечем.
+   */
+  private static boolean isNamedByReference(String tableName) {
+    var segments = tableName.split("\\.", -1);
+    return segments.length >= PAIR_SEGMENTS && MDOType.fromValue(segments[0]).isPresent();
+  }
+
+  /**
+   * Сегмент имени за ссылкой объекта: табличная часть либо виртуальная таблица.
+   *
+   * @return сегмент; {@code null}, если имя — ссылка на объект и ничего больше.
+   */
+  private static @Nullable String tailSegment(String tableName) {
+    var segments = tableName.split("\\.", -1);
+    return segments.length == PAIR_SEGMENTS + 1 ? segments[PAIR_SEGMENTS] : null;
+  }
+
+  private static List<String> tabularSectionNames(MD mdo) {
+    if (!(mdo instanceof TabularSectionOwner owner)) {
+      return List.of();
+    }
+    return owner.getTabularSections().stream().map(MD::getName).toList();
+  }
+
+  private static boolean isTabularSection(List<String> tabularSections, String name) {
+    return tabularSections.stream().anyMatch(name::equalsIgnoreCase);
   }
 
   private List<MemberDescriptor> resolve(String tableName, @Nullable FormDynamicListAttribute list) {
