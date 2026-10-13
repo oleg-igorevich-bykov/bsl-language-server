@@ -633,6 +633,47 @@ class QueryTableResolverTest extends AbstractServerContextAwareTest {
   }
 
   @Test
+  void lookupOfExistingTableGivesItsFields() {
+    // when
+    var lookup = resolver.lookup("Catalog.Справочник1");
+
+    // then
+    assertThat(lookup.status()).isEqualTo(QueryTableResolver.LookupStatus.FIELDS);
+    assertThat(names(lookup.fields())).contains("Ссылка", "Наименование", "Реквизит1");
+  }
+
+  @Test
+  void lookupOfMissingObjectIsDistinguishedFromUnresolved() {
+    // when
+    var lookup = resolver.lookup("Catalog.НетТакогоСправочника");
+
+    // then: имя разобрано целиком как ссылка объекта, но такого объекта в конфигурации нет —
+    // этот исход отличается от «сказать нечего», в котором имя не удалось разобрать вовсе
+    assertThat(lookup.status()).isEqualTo(QueryTableResolver.LookupStatus.UNKNOWN_OBJECT);
+    assertThat(lookup.fields()).isEmpty();
+  }
+
+  @Test
+  void lookupOfUnparsableNameIsUnresolved() {
+    // when
+    var lookup = resolver.lookup("");
+
+    // then
+    assertThat(lookup.status()).isEqualTo(QueryTableResolver.LookupStatus.UNRESOLVED);
+  }
+
+  @Test
+  void lookupOfUnknownVirtualTableOfExistingRegisterIsDistinguishedFromItsSliceLast() {
+    // when
+    var knownVirtualTable = resolver.lookup("InformationRegister.РегистрСведений1.SliceLast");
+    var unknownVirtualTable = resolver.lookup("InformationRegister.РегистрСведений1.НетТакойВиртуальной");
+
+    // then
+    assertThat(knownVirtualTable.status()).isEqualTo(QueryTableResolver.LookupStatus.FIELDS);
+    assertThat(unknownVirtualTable.status()).isEqualTo(QueryTableResolver.LookupStatus.UNKNOWN_TABLE);
+  }
+
+  @Test
   void dynamicListRowGetsFieldsOfItsQueryTable() {
     // given
     // Колонки списка в форме не объявлены: за ним стоит основная таблица, и

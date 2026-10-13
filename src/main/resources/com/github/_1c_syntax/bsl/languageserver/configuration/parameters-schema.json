@@ -1716,6 +1716,16 @@
             "title": "Using non-existent metadata in the query",
             "$id": "#/definitions/QueryToMissingMetadata"
         },
+        "QueryToMissingMetadataField": {
+            "description": "Using a non-existent field or virtual table in the query",
+            "default": true,
+            "type": [
+                "boolean",
+                "object"
+            ],
+            "title": "Using a non-existent field or virtual table in the query",
+            "$id": "#/definitions/QueryToMissingMetadataField"
+        },
         "RedundantAccessToObject": {
             "description": "Redundant access to an object",
             "default": true,
