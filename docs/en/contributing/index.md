@@ -20,3 +20,5 @@ This section contains articles containing information for developers of diagnost
 - General mechanisms
     - [Events subsystem](EventsApi.md)
     - [Performance measurement](Measures.md)
+- Research
+    - [Persisting the index between sessions](PersistentIndex.md)
