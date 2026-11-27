@@ -26,6 +26,7 @@ import com.github._1c_syntax.bsl.languageserver.context.ServerContext;
 import com.github._1c_syntax.bsl.languageserver.context.events.DocumentContextContentChangedEvent;
 import com.github._1c_syntax.bsl.languageserver.context.events.ServerContextDocumentRemovedEvent;
 import com.github._1c_syntax.bsl.languageserver.types.registry.EventHandlerResolver;
+import com.github._1c_syntax.bsl.languageserver.util.EventHandlerResolverStubs;
 import com.github._1c_syntax.bsl.languageserver.util.TestUtils;
 import com.github._1c_syntax.bsl.types.ModuleType;
 import org.eclipse.lsp4j.SymbolKind;
@@ -42,6 +43,7 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
@@ -68,6 +70,7 @@ class WorkspaceSymbolIndexTest extends AbstractServerContextAwareTest {
 
   @BeforeEach
   void resetEventHandlerResolver() {
+    EventHandlerResolverStubs.delegateEventHandlersOfToIsEventHandler(eventHandlerResolver);
     when(eventHandlerResolver.lookupContract(ArgumentMatchers.any(), ArgumentMatchers.anyString()))
       .thenReturn(Optional.empty());
   }
@@ -139,8 +142,8 @@ class WorkspaceSymbolIndexTest extends AbstractServerContextAwareTest {
   }
 
   @Test
-  void removalWhileContextIsClearedDropsEntriesOfAllDocuments() {
-    // given: проиндексированы два документа
+  void removalWhileContextIsClearedDropsEntriesOfAllDocumentsOfThatContext() {
+    // given: проиндексированы два документа очищаемого контекста и документ другого контекста
     var first = TestUtils.getDocumentContext(
       Path.of("./src/test/resources/types/index/ПерваяОчищаемая.bsl").toUri(), """
       Процедура ПерваяОчищаемая()
@@ -151,18 +154,30 @@ class WorkspaceSymbolIndexTest extends AbstractServerContextAwareTest {
       Процедура ВтораяОчищаемая()
       КонецПроцедуры
       """);
+    var foreign = TestUtils.getDocumentContext(
+      Path.of("./src/test/resources/types/index/ЧужаяОстающаяся.bsl").toUri(), """
+      Процедура ЧужаяОстающаяся()
+      КонецПроцедуры
+      """);
     eventPublisher.publishEvent(new DocumentContextContentChangedEvent(first));
     eventPublisher.publishEvent(new DocumentContextContentChangedEvent(second));
+    eventPublisher.publishEvent(new DocumentContextContentChangedEvent(foreign));
     assertThat(index.search("ВтораяОчищаемая", NO_CANCEL)).isNotEmpty();
+    assertThat(index.search("ЧужаяОстающаяся", NO_CANCEL)).isNotEmpty();
     var clearing = mock(ServerContext.class);
     when(clearing.isClearing()).thenReturn(true);
+    // первый документ из карты контекста уже удалён, второй ещё на месте
+    when(clearing.getDocuments()).thenReturn(Map.of(second.getUri(), second));
 
     // when: контекст очищается целиком, и удалён первый документ
     index.handleDocumentRemoved(new ServerContextDocumentRemovedEvent(clearing, first.getUri()));
 
-    // then: индекс очищен разом — записей второго документа в нём тоже нет
+    // then: записи контекста сняты разом — записей второго документа в нём тоже нет
     assertThat(index.search("ПерваяОчищаемая", NO_CANCEL)).isEmpty();
     assertThat(index.search("ВтораяОчищаемая", NO_CANCEL)).isEmpty();
+    // then: записи документа другого контекста остались
+    assertThat(index.search("ЧужаяОстающаяся", NO_CANCEL))
+      .anyMatch(entry -> entry.name().equals("ЧужаяОстающаяся"));
   }
 
   @Test
@@ -724,5 +739,108 @@ class WorkspaceSymbolIndexTest extends AbstractServerContextAwareTest {
     // when / then
     assertThatThrownBy(() -> index.search("Символ", cancelChecker))
       .isInstanceOf(CancellationException.class);
+  }
+
+  @Test
+  void searchWithDocumentFilterAndLimitReturnsBestMatchesOfThatDocument() {
+    // given — точное совпадение есть в обоих документах, отбор оставляет первый
+    var requested = TestUtils.getDocumentContext(
+      Path.of("./src/test/resources/types/index/ОтборЗапрошенный.bsl").toUri(), """
+      Процедура НачалоДатаОтчёта()
+      КонецПроцедуры
+      Процедура ДатаНачала()
+      КонецПроцедуры
+      Процедура Дата()
+      КонецПроцедуры
+      """);
+    var other = TestUtils.getDocumentContext(
+      Path.of("./src/test/resources/types/index/ОтборДругой.bsl").toUri(), """
+      Процедура Дата()
+      КонецПроцедуры
+      """);
+    eventPublisher.publishEvent(new DocumentContextContentChangedEvent(requested));
+    eventPublisher.publishEvent(new DocumentContextContentChangedEvent(other));
+    var requestedUri = requested.getUri();
+
+    // when
+    var limited = index.search("Дата", uri -> uri.equals(requestedUri), 2, NO_CANCEL);
+
+    // then — два лучших совпадения запрошенного документа в том же порядке, что у полной выдачи
+    var fullOfRequested = index.search("Дата", NO_CANCEL).stream()
+      .filter(entry -> entry.uri().equals(requestedUri))
+      .limit(2)
+      .toList();
+    assertThat(limited)
+      .extracting(Entry::name)
+      .containsExactly("Дата", "ДатаНачала");
+    assertThat(limited).containsExactlyElementsOf(fullOfRequested);
+  }
+
+  @Test
+  void emptyQueryWithDocumentFilterAndLimitStopsAtLimit() {
+    // given
+    var requested = TestUtils.getDocumentContext(
+      Path.of("./src/test/resources/types/index/ОтборПустогоЗапроса.bsl").toUri(), """
+      Процедура Первая()
+      КонецПроцедуры
+      Процедура Вторая()
+      КонецПроцедуры
+      Процедура Третья()
+      КонецПроцедуры
+      """);
+    eventPublisher.publishEvent(new DocumentContextContentChangedEvent(requested));
+    var requestedUri = requested.getUri();
+
+    // when
+    var limited = index.search("", uri -> uri.equals(requestedUri), 2, NO_CANCEL);
+
+    // then
+    assertThat(limited)
+      .hasSize(2)
+      .allMatch(entry -> entry.uri().equals(requestedUri));
+  }
+
+  @Test
+  void searchFuzzyTailWithDocumentFilterAndLimitKeepsBestOfThatDocument() {
+    // given — для «кумен» подстрочное совпадение ранжируется выше подпоследовательностного
+    var requested = TestUtils.getDocumentContext(
+      Path.of("./src/test/resources/types/index/ОтборХвостаЗапрошенный.bsl").toUri(), """
+      Процедура КрасныйУзелМаленький()
+      КонецПроцедуры
+      Процедура ПровестиДокумент()
+      КонецПроцедуры
+      """);
+    var other = TestUtils.getDocumentContext(
+      Path.of("./src/test/resources/types/index/ОтборХвостаДругой.bsl").toUri(), """
+      Процедура ПровестиДокумент()
+      КонецПроцедуры
+      """);
+    eventPublisher.publishEvent(new DocumentContextContentChangedEvent(requested));
+    eventPublisher.publishEvent(new DocumentContextContentChangedEvent(other));
+    var requestedUri = requested.getUri();
+
+    // when
+    var limited = index.searchFuzzyTail("кумен", emptyExclude(), uri -> uri.equals(requestedUri), 1, NO_CANCEL);
+
+    // then
+    assertThat(limited).singleElement().satisfies(entry -> {
+      assertThat(entry.name()).isEqualTo("ПровестиДокумент");
+      assertThat(entry.uri()).isEqualTo(requestedUri);
+    });
+  }
+
+  @Test
+  void searchWithZeroLimitReturnsNothing() {
+    // given
+    var documentContext = TestUtils.getDocumentContext("""
+      Процедура ДатаНулевогоЛимита()
+      КонецПроцедуры
+      """);
+    eventPublisher.publishEvent(new DocumentContextContentChangedEvent(documentContext));
+
+    // when / then
+    assertThat(index.search("ДатаНулевогоЛимита", uri -> true, 0, NO_CANCEL)).isEmpty();
+    assertThat(index.search("", uri -> true, 0, NO_CANCEL)).isEmpty();
+    assertThat(index.searchFuzzyTail("нулевого", emptyExclude(), uri -> true, 0, NO_CANCEL)).isEmpty();
   }
 }

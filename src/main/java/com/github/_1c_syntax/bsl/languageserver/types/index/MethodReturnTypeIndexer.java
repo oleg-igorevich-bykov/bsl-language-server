@@ -23,10 +23,14 @@ package com.github._1c_syntax.bsl.languageserver.types.index;
 
 import com.github._1c_syntax.bsl.languageserver.client.WorkDoneProgressHelper;
 import com.github._1c_syntax.bsl.languageserver.configuration.GlobalLanguageServerConfiguration;
+import com.github._1c_syntax.bsl.languageserver.configuration.LanguageServerConfiguration;
+import com.github._1c_syntax.bsl.languageserver.configuration.events.LanguageServerConfigurationChangedEvent;
 import com.github._1c_syntax.bsl.languageserver.configuration.Resources;
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
 import com.github._1c_syntax.bsl.languageserver.context.DocumentState;
 import com.github._1c_syntax.bsl.languageserver.context.ServerContext;
+import com.github._1c_syntax.bsl.languageserver.context.events.DocumentContextConfigurationBindingChangedEvent;
+import com.github._1c_syntax.bsl.languageserver.context.ServerContextProvider;
 import com.github._1c_syntax.bsl.languageserver.context.events.DocumentContextContentChangedEvent;
 import com.github._1c_syntax.bsl.languageserver.context.events.ServerContextDocumentClearedEvent;
 import com.github._1c_syntax.bsl.languageserver.context.events.ServerContextDocumentClosedEvent;
@@ -34,18 +38,22 @@ import com.github._1c_syntax.bsl.languageserver.context.events.ServerContextPopu
 import com.github._1c_syntax.bsl.languageserver.context.symbol.MethodSymbol;
 import com.github._1c_syntax.bsl.languageserver.index.AbstractDocumentLifecycleClearableIndex;
 import com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceScope;
+import com.github._1c_syntax.bsl.languageserver.infrastructure.WorkspaceContextHolder;
 import com.github._1c_syntax.bsl.languageserver.types.inferencer.ExpressionTypeInferencer;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeSet;
+import com.github._1c_syntax.bsl.languageserver.types.registry.MemberLookupSession;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.jspecify.annotations.Nullable;
+import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.event.EventListener;
 import org.springframework.core.annotation.Order;
+import org.springframework.core.Ordered;
 import org.springframework.stereotype.Component;
 
 import java.net.URI;
 import java.util.ArrayDeque;
-import java.util.Deque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -57,14 +65,20 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.IntStream;
 
@@ -96,15 +110,22 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
 
   /**
    * Сколько документов допустимо держать разобранными разом: и ради обхода цикла, и ради
-   * параллельного счёта яруса.
+   * параллельного счёта компонент.
    */
   private static final int MAX_DOCUMENTS_IN_MEMORY = 8;
 
+  private static final Object UNSCOPED_INPUTS = new Object();
+
   private final ExpressionTypeInferencer inferencer;
   private final SymbolTypeIndex symbolTypeIndex;
+  private final InferredExpressionTypeIndex inferredExpressionTypeIndex;
 
   private final WorkDoneProgressHelper workDoneProgressHelper;
   private final GlobalLanguageServerConfiguration globalConfiguration;
+  private final LanguageServerConfiguration configuration;
+  private final ServerContextProvider serverContextProvider;
+  /** Значение настройки, для которого построен индекс; остальные изменения конфигурации его не сбрасывают. */
+  private boolean supportThickClientFileMode;
 
   /**
    * Пул, на котором считаются компоненты одного яруса. Свой, а не пул наполнения: проход
@@ -138,8 +159,8 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
   /** Методы, тела которых уже разбирались: пустой ответ у них значит «ничего не возвращает». */
   private final Set<MethodSymbol> indexed = ConcurrentHashMap.newKeySet();
 
-  /** Методы, значение которых посчитано по приближениям и ждёт пересчёта (см. computeIfAbsent). */
-  private final Set<MethodSymbol> provisional = ConcurrentHashMap.newKeySet();
+  /** Допуск публикаций и состояние предварительных результатов. */
+  private final ReturnPublication publication = new ReturnPublication();
 
   /**
    * Часы, по которым видно, что чей расчёт застал, а что появилось уже после него. Своё
@@ -157,11 +178,75 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
   /** Сколько раз менялось чьё-либо значение: волна, не изменившая ничего, повторилась бы дословно. */
   private final AtomicLong valueChanges = new AtomicLong();
 
-  /** Сколько раз пришлось перечитать документ за общий проход — для отладочного счёта. */
-  private final AtomicInteger rebuilt = new AtomicInteger();
+  /** Общее число перечитываний и число уникальных документов за проход. */
+  private final DocumentRebuildStatistics rebuilds = new DocumentRebuildStatistics();
 
-  /** Какие документы перечитывались: волн несколько, и один документ может попасть в разбор не раз. */
-  private final Set<URI> rebuiltUris = ConcurrentHashMap.newKeySet();
+  @PostConstruct
+  void captureCompilationSettings() {
+    supportThickClientFileMode = configuration.isSupportThickClientFileMode();
+  }
+
+  /**
+   * Пересчитать выведенные возвращаемые типы при смене поддерживаемых режимов проекта.
+   * <p>
+   * Выполняется после сброса окружений и выражений, до обновления диагностик и подсказок.
+   * Используется обычный проход индекса с ограничением числа одновременно загруженных документов.
+   * Смена настроек ждёт завершения активного прохода: его финальная очистка очереди
+   * не должна стереть новый план пересчёта. Рабочие задачи прохода этот монитор не берут.
+   *
+   * @param event новые настройки рабочей области.
+   */
+  @Order(Ordered.HIGHEST_PRECEDENCE + 100)
+  @EventListener
+  public synchronized void handleConfigurationChanged(LanguageServerConfigurationChangedEvent event) {
+    var enabled = event.getSource().isSupportThickClientFileMode();
+    if (enabled == supportThickClientFileMode) {
+      return;
+    }
+    supportThickClientFileMode = enabled;
+    resetPublication();
+    var workspace = WorkspaceContextHolder.get();
+    var context = workspace == null ? null : serverContextProvider.getAllContexts().get(workspace);
+    if (context != null && !context.isClearing() && !maintenance && !pending.isEmpty()) {
+      handleServerContextPopulated(new ServerContextPopulatedEvent(context));
+    }
+  }
+
+  private void resetPublication() {
+    var exclusive = publication.gate.writeLock();
+    try {
+      exclusive.lock();
+      try {
+        configurationGeneration().current = false;
+        publication.generation.set(ConfigurationGeneration.RESETTING);
+        // Принятые публикации закончат обновление SymbolTypeIndex до очистки.
+        // Новые публикации и результаты прежнего поколения больше не принимаются.
+        while (!publication.inProgress.isEmpty()) {
+          publication.changed.awaitUninterruptibly();
+        }
+
+        pending.addAll(indexed);
+        indexed.clear();
+        publication.provisional.clear();
+      } finally {
+        exclusive.unlock();
+      }
+      // Слот computedAt берётся до допуска к публикации, поэтому очищаем карту без блокировки допуска.
+      computedAt.clear();
+      changedAt.clear();
+      symbolTypeIndex.clearInferredReturnTypes();
+      // За время между ранним сбросом выражений и закрытием публикации могли появиться новые записи.
+      inferredExpressionTypeIndex.clearAll();
+    } finally {
+      exclusive.lock();
+      try {
+        publication.generation.set(new ConfigurationGeneration(true));
+        publication.changed.signalAll();
+      } finally {
+        exclusive.unlock();
+      }
+    }
+  }
 
   /**
    * Считает типы возврата метода по телу, если этого ещё не делалось, и складывает
@@ -191,23 +276,89 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
    *                    расчёта устареют.
    */
   public void computeIfAbsent(MethodSymbol method, Supplier<ComputedReturnTypes> computation, boolean approximate) {
-    if (!method.isFunction()) {
-      return;
+    computeIfAbsent(method, computation, approximate, UNSCOPED_INPUTS);
+  }
+
+  /**
+   * Считает значение с ключом текущих приближений. Предварительное значение повторно используется
+   * только при совпадении ключа по ссылке; после изменения ячеек или защиты вызывающий передаёт новый.
+   * Ключ не должен удерживать дерево разбора или состояние запроса.
+   *
+   * @param method метод.
+   * @param computation расчёт в контексте вызывающего.
+   * @param approximate считается ли значение по текущим приближениям.
+   * @param inputs непрозрачный ключ входных данных и защиты текущего расчёта.
+   * @return результат выполненного расчёта либо {@code null}, если расчёт не потребовался.
+   */
+  public @Nullable ComputedReturnTypes computeIfAbsent(MethodSymbol method, Supplier<ComputedReturnTypes> computation,
+                                                       boolean approximate, Object inputs) {
+    return computeIfAbsent(method, computation, approximate, inputs, null);
+  }
+
+  /**
+   * Поколение, которое исходный запрос вывода передаёт своим вложенным расчётам.
+   *
+   * @return токен текущего поколения либо токен временно закрытой публикации.
+   */
+  public ConfigurationGeneration configurationGeneration() {
+    return publication.generation.get();
+  }
+
+  /**
+   * Посчитать метод по запросу и опубликовать результат в пределах поколения исходного запроса.
+   *
+   * @param method      рассчитываемый метод.
+   * @param computation вывод типа вне блокировок индекса.
+   * @param approximate мог ли расчёт использовать промежуточные значения.
+   * @param inputs      идентичность входов предварительного расчёта.
+   * @param requestedGeneration поколение исходного запроса либо {@code null} для нового запроса.
+   * @return результат расчёта либо {@code null}, если расчёт не нужен или поколение уже сменилось.
+   */
+  public @Nullable ComputedReturnTypes computeIfAbsent(MethodSymbol method, Supplier<ComputedReturnTypes> computation,
+                                                       boolean approximate, Object inputs,
+                                                        @Nullable ConfigurationGeneration requestedGeneration) {
+    var result = computeOrReuse(method, computation, approximate, inputs, requestedGeneration);
+    return result instanceof ComputedReturnTypes computed ? computed : null;
+  }
+
+  /**
+   * Возвращает собственный расчёт либо снимок предварительного значения с теми же входами.
+   * Ключ и тип читаются из одной записи. При готовом значении вызывающий обращается к общему индексу.
+   *
+   * @param method рассчитываемый метод.
+   * @param computation вывод типа вне блокировок индекса.
+   * @param approximate допускаются ли результаты расчёта по приближениям.
+   * @param inputs идентичность входов предварительного расчёта.
+   * @param requestedGeneration поколение исходного запроса либо {@code null} для нового запроса.
+   * @return снимок результата либо {@code null} для чтения общего индекса.
+   */
+  public @Nullable OnDemandReturnTypes computeOrReuse(MethodSymbol method, Supplier<ComputedReturnTypes> computation,
+                                                     boolean approximate, Object inputs,
+                                                     @Nullable ConfigurationGeneration requestedGeneration) {
+    var generation = requestedGeneration == null ? configurationGeneration() : requestedGeneration;
+    if (!generation.isCurrent() || generation != configurationGeneration()
+      || !method.isFunction()) {
+      return null;
     }
-    var known = indexed.contains(method);
-    if (known && (approximate || !provisional.contains(method))) {
-      return;
+    if (indexed.contains(method)) {
+      var previous = publication.provisional.get(new MethodDeclarationKey(method));
+      if (previous == null) {
+        return null;
+      }
+      var reused = approximate ? previous.estimateFor(inputs) : null;
+      if (reused != null) {
+        return generation.isCurrent() ? reused : null;
+      }
     }
+    return computeAndStore(method, computation, approximate, inputs, generation);
+  }
+
+  private @Nullable ComputedReturnTypes computeAndStore(MethodSymbol method,
+    Supplier<ComputedReturnTypes> computation, boolean approximate, Object inputs, ConfigurationGeneration generation) {
     var startedAt = clock.incrementAndGet();
-    store(method, computation.get(), startedAt);
-    if (approximate) {
-      provisional.add(method);
-    } else {
-      provisional.remove(method);
-    }
-    if (!known) {
-      rememberMethodOfUri(method);
-    }
+    var computed = computation.get();
+    var result = store(method, computed, startedAt, provisionalResult(computed, approximate, inputs), true, generation);
+    return result != StoreResult.DISCARDED && generation == configurationGeneration() ? computed : null;
   }
 
   /**
@@ -233,7 +384,7 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
    * @return {@code true}, если типы возврата метода уже выводились и не по приближениям.
    */
   public boolean isIndexed(MethodSymbol method) {
-    return indexed.contains(method) && !provisional.contains(method);
+    return indexed.contains(method) && !publication.provisional.containsKey(new MethodDeclarationKey(method));
   }
 
   /**
@@ -256,7 +407,24 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
       // расчёт с чистого листа рвёт цепочку взаимных вызовов в другом месте.
       return;
     }
-    var documentContext = event.getSource();
+    reindexDocument(event.getSource());
+  }
+
+  /**
+   * Посчитать заново значения документа, у которого изменилась привязка к метаданным
+   * конфигурации. Его дерево символов построено заново, а методы нового дерева не равны
+   * прежним, если сменился их вид, поэтому значения, записанные по прежним, уже не найти.
+   *
+   * @param event событие изменения привязки документа.
+   */
+  @Order(300)
+  @EventListener
+  @Override
+  public void handleConfigurationBindingChanged(DocumentContextConfigurationBindingChangedEvent event) {
+    reindexDocument(event.getSource());
+  }
+
+  private void reindexDocument(DocumentContext documentContext) {
     clear(documentContext.getUri());
     var changed = recomputeDocument(documentContext);
     if (maintenance) {
@@ -280,28 +448,27 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
    * @param event событие наполнения рабочей области.
    */
   @EventListener
-  public void handleServerContextPopulated(ServerContextPopulatedEvent event) {
+  public synchronized void handleServerContextPopulated(ServerContextPopulatedEvent event) {
     var serverContext = event.getSource();
     maintenance = true;
     var deferred = pending.size();
     var startedAt = System.nanoTime();
-    rebuilt.set(0);
-    rebuiltUris.clear();
+    rebuilds.clear();
     var progressReporter = workDoneProgressHelper.createProgress(
       documentsOf(pending),
       getMessage("resolveDocumentsPostfix")
     );
     progressReporter.beginProgress(getMessage("resolveReturnTypes"));
     try {
-      drainPending(serverContext, progressReporter);
+      drainPending(serverContext, new ResolveProgress(progressReporter));
     } finally {
       maintenance = false;
       pending.clear();
       progressReporter.endProgress(getMessage("resolveReturnTypesDone"));
     }
-    LOGGER.debug("Доразрешение типов возврата: отложено методов {}, разборов документов {},"
-        + " из них различных документов {}, заняло {} мс",
-      deferred, rebuilt.get(), rebuiltUris.size(), (System.nanoTime() - startedAt) / 1_000_000);
+    LOGGER.info(
+      "Return types resolved in {} ms: {} deferred methods, {} document parse attempts of {} documents",
+      (System.nanoTime() - startedAt) / 1_000_000, deferred, rebuilds.total(), rebuilds.distinct());
   }
 
   /**
@@ -341,9 +508,15 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
     changedAt.remove(uri);
     var methods = methodsByUri.remove(uri);
     if (methods != null) {
+      var exclusive = publication.gate.writeLock();
       methods.forEach(method -> {
-        indexed.remove(method);
-        provisional.remove(method);
+        exclusive.lock();
+        try {
+          indexed.remove(method);
+          publication.provisional.remove(new MethodDeclarationKey(method));
+        } finally {
+          exclusive.unlock();
+        }
         computedAt.remove(method);
       });
     }
@@ -360,23 +533,25 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
    * @return методы, у которых набор типов изменился.
    */
   private List<MethodSymbol> recomputeDocument(DocumentContext documentContext) {
-    var changed = new ArrayList<MethodSymbol>();
-    var methods = new ArrayList<MethodSymbol>();
-    for (var method : documentContext.getSymbolTree().getMethods()) {
-      // Заранее считаются только экспортные функции: остальные видны лишь внутри своего
-      // документа и считаются по запросу (см. getOrCompute).
-      if (!method.isFunction() || !method.isExport()) {
-        continue;
+    try (var scope = MemberLookupSession.openIfAbsent()) {
+      var changed = new ArrayList<MethodSymbol>();
+      var methods = new ArrayList<MethodSymbol>();
+      for (var method : documentContext.getSymbolTree().getMethods()) {
+        // Заранее считаются только экспортные функции: остальные видны лишь внутри своего
+        // документа и считаются по запросу (см. getOrCompute).
+        if (!method.isFunction() || !method.isExport()) {
+          continue;
+        }
+        methods.add(method);
+        if (recompute(method)) {
+          changed.add(method);
+        }
       }
-      methods.add(method);
-      if (recompute(method)) {
-        changed.add(method);
+      if (!methods.isEmpty()) {
+        rememberMethodsOfUri(documentContext.getUri(), methods);
       }
+      return changed;
     }
-    if (!methods.isEmpty()) {
-      rememberMethodsOfUri(documentContext.getUri(), methods);
-    }
-    return changed;
   }
 
   /**
@@ -414,13 +589,53 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
    * @return {@code true}, если набор типов изменился.
    */
   private boolean recompute(MethodSymbol method) {
-    // Отметка снимается до расчёта: значение, изменившееся уже во время него, расчёт
-    // застать не мог, и вызывающему понадобится ещё один заход.
-    var startedAt = clock.incrementAndGet();
-    var changed = store(method, inferencer.computeReturnTypes(method), startedAt);
-    // Расчёт со свежего контекста идёт не посреди кругов: значение окончательное.
-    provisional.remove(method);
-    return changed;
+    while (!Thread.currentThread().isInterrupted()) {
+      var generation = awaitGeneration();
+      if (generation == null) {
+        return false;
+      }
+      // Отметка снимается до расчёта: значение, изменившееся уже во время него, расчёт
+      // застать не мог, и вызывающему понадобится ещё один заход.
+      var startedAt = clock.incrementAndGet();
+      var computed = inferencer.computeReturnTypes(method);
+      var result = store(method, computed, startedAt, provisionalResult(computed, false, UNSCOPED_INPUTS),
+        false, generation);
+      if (result != StoreResult.DISCARDED) {
+        return result == StoreResult.CHANGED;
+      }
+    }
+    return false;
+  }
+
+  private @Nullable ConfigurationGeneration awaitGeneration() {
+    var generation = configurationGeneration();
+    if (generation != ConfigurationGeneration.RESETTING) {
+      return generation;
+    }
+    var exclusive = publication.gate.writeLock();
+    exclusive.lock();
+    try {
+      while ((generation = configurationGeneration()) == ConfigurationGeneration.RESETTING) {
+        try {
+          publication.changed.await();
+        } catch (InterruptedException exception) {
+          Thread.currentThread().interrupt();
+          return null;
+        }
+      }
+      return generation;
+    } finally {
+      exclusive.unlock();
+    }
+  }
+
+  private static @Nullable ProvisionalReturn provisionalResult(ComputedReturnTypes computed, boolean approximate,
+                                                               Object inputs) {
+    if (approximate || computed.incomplete()) {
+      var missing = approximate ? null : computed.incompleteMethodReturns();
+      return new ProvisionalReturn(inputs, missing, new ReusedReturnTypes(computed.types()));
+    }
+    return null;
   }
 
   /**
@@ -429,10 +644,71 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
    * @param method    метод.
    * @param computed  результат расчёта.
    * @param startedAt отметка часов на момент начала расчёта.
-   * @return {@code true}, если набор типов изменился.
+   * @param partial   признак предварительного значения либо {@code null} для окончательного.
+   * @param onDemand  расчёт, начатый из-за отсутствия готового результата.
+   * @param generation поколение настроек, для которого получен результат.
+   * @return результат публикации, включая отклонённый устаревший расчёт.
    */
-  private boolean store(MethodSymbol method, ComputedReturnTypes computed, long startedAt) {
-    link(method, computed.consulted());
+  private StoreResult store(MethodSymbol method, ComputedReturnTypes computed, long startedAt,
+                            @Nullable ProvisionalReturn partial, boolean onDemand,
+                            ConfigurationGeneration generation) {
+    var result = new AtomicReference<>(StoreResult.DISCARDED);
+    // Блокировка записи computedAt объединяет публикацию типа и признака неполноты.
+    // Расчёт тела выполняется до её захвата: тело может вызывать другие функции.
+    computedAt.compute(method, (MethodSymbol key, @Nullable Long publishedAt) -> {
+      var declaration = new MethodDeclarationKey(key);
+      if (!beginPublication(declaration, onDemand && partial != null, generation)) {
+        return publishedAt;
+      }
+      try {
+        if (onDemand && !indexed.contains(key)) {
+          rememberMethodOfUri(key);
+        }
+        link(key, computed.consulted());
+        schedulePending(key, computed);
+        result.set(publishReturnType(declaration, computed.types(), startedAt, partial)
+          ? StoreResult.CHANGED : StoreResult.UNCHANGED);
+        return startedAt;
+      } finally {
+        finishPublication(declaration, partial == null && result.get() != StoreResult.DISCARDED);
+      }
+    });
+    return result.get();
+  }
+
+  private boolean beginPublication(MethodDeclarationKey declaration, boolean keepCompleted,
+                                   ConfigurationGeneration generation) {
+    var admission = publication.gate.readLock();
+    admission.lock();
+    try {
+      if (configurationGeneration() != generation || (keepCompleted && isIndexed(declaration.method()))) {
+        return false;
+      }
+      publication.inProgress.add(declaration);
+      return true;
+    } finally {
+      admission.unlock();
+    }
+  }
+
+  private void finishPublication(MethodDeclarationKey declaration, boolean complete) {
+    if (complete) {
+      publication.provisional.remove(declaration);
+    }
+    // После снятия отметки метод можно проверять при завершении компоненты.
+    publication.inProgress.remove(declaration);
+    if (configurationGeneration() == ConfigurationGeneration.RESETTING && publication.inProgress.isEmpty()) {
+      var exclusive = publication.gate.writeLock();
+      exclusive.lock();
+      try {
+        publication.changed.signalAll();
+      } finally {
+        exclusive.unlock();
+      }
+    }
+  }
+
+  private void schedulePending(MethodSymbol method, ComputedReturnTypes computed) {
     if (!maintenance && computed.consulted().stream().anyMatch(pending::contains)) {
       // Расчёт опирался на значение, которое само ждёт пересчёта: вызванный метод посчитан,
       // но предварительно. Когда проход доведёт его до полного, вызывающему понадобится
@@ -459,15 +735,23 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
           method.getName(), method.getOwner().getUri(),
           computed.consulted().stream()
             .filter(dependency -> !indexed.contains(dependency))
-            .map(dependency -> dependency.getName() + "@" + dependency.getOwner().getMdoRef())
+            .map(dependency -> dependency.getName() + "@" + dependency.getOwner().getUri())
             .toList());
       }
     }
+  }
+
+  private boolean publishReturnType(MethodDeclarationKey declaration, TypeSet types, long startedAt,
+                                    @Nullable ProvisionalReturn partial) {
+    var method = declaration.method();
+    // Признак неполноты виден до обновления типа и indexed.
+    if (partial != null) {
+      publication.provisional.put(declaration, partial);
+    }
     var previous = symbolTypeIndex.getReturnTypes(method);
-    symbolTypeIndex.putReturnTypes(method, computed.types());
+    symbolTypeIndex.putReturnTypes(method, types);
     indexed.add(method);
     var valueChanged = !symbolTypeIndex.getReturnTypes(method).equals(previous);
-    computedAt.put(method, startedAt);
     if (valueChanged) {
       // Обе отметки берутся из одной точки — до расчёта. Строго полнее было бы отмечать
       // изменение уже после того, как значение выложено: тогда ловился бы и расчёт,
@@ -568,24 +852,16 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
   /**
    * Разносит накопленные общим проходом изменения, догружая документы потребителей.
    *
-   * @param serverContext    рабочая область.
-   * @param progressReporter индикатор хода работы.
+   * @param serverContext рабочая область.
+   * @param progress      ход работы.
    */
-  private void drainPending(
-    ServerContext serverContext,
-    WorkDoneProgressHelper.WorkDoneProgressReporter progressReporter
-  ) {
-    var planned = 0;
+  private void drainPending(ServerContext serverContext, ResolveProgress progress) {
     for (var pass = 0; pass < MAX_PASSES && !pending.isEmpty(); pass++) {
       var roots = List.copyOf(pending);
       pending.clear();
-      // Проход вскрывает новые зависимости, поэтому общий объём работы заранее не
-      // известен: наращиваем его по мере того, как работа находится. Считается ровно то,
-      // по чему идёт отсчёт, — документы, иначе числитель убегает за знаменатель.
-      planned += documentsOf(roots);
-      progressReporter.setSize(planned);
+      progress.plan(documentsOf(roots));
       var changesBefore = valueChanges.get();
-      resolveAll(serverContext, roots, progressReporter);
+      resolveAll(serverContext, roots, progress);
       // План волны строится по связям, известным на её начало, а вскрываются они её же
       // расчётом: метод, чья зависимость обогатилась после него, отложить было некому.
       var outdated = outdated();
@@ -628,33 +904,29 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
    * приходится документ целиком, и один документ загружался заново под каждый свой
    * метод — на ssl_3_1 это дало 4252 разбора против 215.
    * <p>
-   * Компоненты одного яруса считаются разом: зависимостей между ними нет по построению,
-   * документы у них разные, и каждая берёт замки только своих. Ярусов на реальной
-   * конфигурации единицы, а компонент в первом — больше половины, поэтому ярусный обход
-   * распараллеливается почти целиком. Пул нужен именно тот, чьи воркеры несут рабочую
-   * область: без неё бины workspace-скоупа из чужого потока не достаются.
+   * Компонента начинает считаться, как только посчитаны все, от кого она зависит, и в
+   * пределе разом разобранных документов нашлось место на все её документы: цикл занимает
+   * столько мест, сколько в нём документов, цикл крупнее предела — весь предел. Ярусами,
+   * как прежде, выходило медленнее: ярус ждал самую долгую компоненту прошлого, даже не
+   * завися от неё, а циклы яруса считались по одному. Пул нужен именно тот, чьи воркеры
+   * несут рабочую область: без неё бины workspace-скоупа из чужого потока не достаются.
    * <p>
-   * Разом разобранных документов при этом не больше {@link #MAX_DOCUMENTS_IN_MEMORY} —
-   * столько же, сколько проход и так позволяет себе на одном цикле. Параллельно идут
-   * только компоненты из одного документа, держащие несколько считаются по одной, а место
-   * в пределе занимается на время расчёта компоненты.
-   * <p>
-   * Независимость компонент яруса опирается на связи, собранные прошлым расчётом, а
-   * пересчёт способен дойти до документа, которого в них не было: до наполнения области
-   * вызов туда не разрешался вовсе. Такой документ может считаться в это же время
-   * соседней компонентой, и что прочтёт расчёт, решит момент. Из-под порядка это не
-   * выбивается: он и в последовательном проходе задан набором отложенного, то есть тоже
-   * не воспроизводится дословно; замер мерцания на ssl_3_1 разницы между проходами не
+   * Независимость одновременно считаемых компонент опирается на связи, собранные прошлым
+   * расчётом, а пересчёт способен дойти до документа, которого в них не было: до
+   * наполнения области вызов туда не разрешался вовсе. Такой документ может считаться в
+   * это же время другой компонентой, и что прочтёт расчёт, решит момент. Из-под порядка
+   * это не выбивается: он и в последовательном проходе задан набором отложенного, то есть
+   * тоже не воспроизводится дословно; замер мерцания на ssl_3_1 разницы между проходами не
    * показал.
    *
    * @param serverContext    рабочая область.
    * @param roots            отложенные методы.
-   * @param progressReporter индикатор хода работы.
+   * @param progress         ход работы.
    */
   private void resolveAll(
     ServerContext serverContext,
     List<MethodSymbol> roots,
-    WorkDoneProgressHelper.WorkDoneProgressReporter progressReporter
+    ResolveProgress progress
   ) {
     var byDocument = new LinkedHashMap<URI, List<MethodSymbol>>();
     for (var root : roots) {
@@ -662,92 +934,27 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
     }
     var order = DocumentDependencies.of(byDocument.keySet(),
       uri -> dependenciesByUri.getOrDefault(uri, Set.of()));
-    for (var tier : tiersOf(order.components(), byDocument.keySet())) {
-      // Компонента из нескольких документов — цикл: она держит их разобранными до
-      // неподвижной точки. Такие считаются по одной, иначе предел держимых документов
-      // множился бы на ширину пула, а память здесь дороже секунд. Их единицы: на реальной
-      // конфигурации почти каждая компонента — один документ.
-      var cycles = tier.stream().filter(component -> component.size() > 1).toList();
-      for (var cycle : cycles) {
-        resolveComponent(serverContext, cycle, byDocument, progressReporter);
-      }
-      var singles = tier.stream().filter(component -> component.size() == 1).toList();
-      if (singles.size() == 1) {
-        resolveComponent(serverContext, singles.get(0), byDocument, progressReporter);
-        continue;
-      }
-      var loaded = new Semaphore(MAX_DOCUMENTS_IN_MEMORY);
-      var tasks = singles.stream()
-        .map(component -> CompletableFuture.runAsync(
-          () -> resolveHoldingPermit(loaded, serverContext, component, byDocument, progressReporter),
-          resolveReturnTypesExecutor))
-        .toArray(CompletableFuture[]::new);
-      CompletableFuture.allOf(tasks).join();
-    }
-  }
-
-  /**
-   * Считает компоненту, заняв место в пределе разом разобранных документов.
-   * <p>
-   * Предел явный, а не «сколько воркеров в пуле»: ширина пула берётся из числа ядер, и на
-   * большой машине проход держал бы разобранными десятки документов. Дерево разбора —
-   * самое тяжёлое, что есть у документа, поэтому счёт идёт на документы, а не на потоки.
-   *
-   * @param loaded           предел разом разобранных документов.
-   * @param serverContext    рабочая область.
-   * @param component        документы компоненты.
-   * @param byDocument       отложенные методы по документам.
-   * @param progressReporter индикатор хода работы.
-   */
-  private void resolveHoldingPermit(
-    Semaphore loaded,
-    ServerContext serverContext,
-    List<URI> component,
-    Map<URI, List<MethodSymbol>> byDocument,
-    WorkDoneProgressHelper.WorkDoneProgressReporter progressReporter
-  ) {
-    loaded.acquireUninterruptibly();
     try {
-      resolveComponent(serverContext, component, byDocument, progressReporter);
-    } finally {
-      loaded.release();
-    }
-  }
-
-  /**
-   * Разбивает компоненты на ярусы: компонента попадает на ярус следующий за наибольшим
-   * ярусом тех, от кого она зависит.
-   * <p>
-   * Компоненты приходят в обратном топологическом порядке, поэтому ярус каждой известен к
-   * моменту, когда до неё дошла очередь. Внутри яруса зависимостей нет, и считать его
-   * компоненты можно в любом порядке и одновременно.
-   *
-   * @param components компоненты в обратном топологическом порядке.
-   * @param inWork     документы, которые предстоит пересчитать: зависимости на прочие
-   *                   порядка не задают — те уже посчитаны окончательно.
-   * @return ярусы в порядке возрастания.
-   */
-  private List<List<List<URI>>> tiersOf(List<List<URI>> components, Set<URI> inWork) {
-    var tierOfUri = new HashMap<URI, Integer>();
-    var tiers = new ArrayList<List<List<URI>>>();
-    for (var component : components) {
-      var tier = component.stream()
-        .flatMap(uri -> dependenciesByUri.getOrDefault(uri, Set.<URI>of()).stream())
-        .filter(inWork::contains)
-        .map(dependency -> tierOfUri.getOrDefault(dependency, 0))
-        .max(Integer::compare)
-        .orElse(0);
-      component.forEach(uri -> tierOfUri.put(uri, tier + 1));
-      while (tiers.size() <= tier) {
-        tiers.add(new ArrayList<>());
+      new ComponentDispatch(serverContext, order.components(), byDocument, progress).start().join();
+    } catch (CompletionException e) {
+      // Наружу — исключение самого расчёта, а не обёртка пула: так же, как при счёте в этом потоке.
+      Throwable cause = e;
+      while (cause instanceof CompletionException && cause.getCause() != null) {
+        cause = cause.getCause();
       }
-      tiers.get(tier).add(component);
+      if (cause instanceof RuntimeException runtimeException) {
+        throw runtimeException;
+      }
+      if (cause instanceof Error error) {
+        throw error;
+      }
+      throw e;
     }
-    return tiers;
   }
 
   /**
-   * Доводит до неподвижной точки компоненту сильной связности.
+   * Доводит до неподвижной точки компоненту сильной связности, документы которой можно
+   * держать разобранными разом.
    * <p>
    * Компонента из одного документа считается за один заход: всё, от чего она зависит, уже
    * посчитано. В цикле заходов несколько, поэтому его документы держатся загруженными —
@@ -756,13 +963,13 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
    * @param serverContext    рабочая область.
    * @param component        документы компоненты.
    * @param byDocument       отложенные методы по документам.
-   * @param progressReporter индикатор хода работы.
+   * @param progress         ход работы.
    */
   private void resolveComponent(
     ServerContext serverContext,
     List<URI> component,
     Map<URI, List<MethodSymbol>> byDocument,
-    WorkDoneProgressHelper.WorkDoneProgressReporter progressReporter
+    ResolveProgress progress
   ) {
     var methods = component.stream().flatMap(uri -> byDocument.get(uri).stream()).toList();
     try {
@@ -770,8 +977,8 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
     } finally {
       // Единица счёта — документ: он и есть единица работы прохода, а методов в нём
       // сколько угодно. Отсчёт после работы: компонента считается целиком, и до её конца
-      // сказать про её документы нечего, а ярус вдобавок считается сразу многими потоками.
-      component.forEach(uri -> progressReporter.tick());
+      // сказать про её документы нечего, а компоненты вдобавок считаются сразу многими потоками.
+      progress.done(component.size());
     }
   }
 
@@ -793,10 +1000,6 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
       recomputeLoading(serverContext, byDocument.get(component.get(0)));
       return;
     }
-    if (component.size() > MAX_DOCUMENTS_IN_MEMORY) {
-      resolveUnloaded(serverContext, component, byDocument);
-      return;
-    }
     withDocumentsLoaded(serverContext, component, () -> {
       for (var pass = 0; pass < MAX_PASSES; pass++) {
         var changed = false;
@@ -804,6 +1007,7 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
           changed |= recompute(method);
         }
         if (!changed) {
+          completeComponent(component);
           return;
         }
       }
@@ -821,133 +1025,576 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
    * разрывает прежнее значение, и изменившийся документ на новом заходе может посчитаться
    * иначе. У прочих на входе ровно то же, что и в прошлый раз, и пересчёт ничего бы не дал.
    * <p>
-   * Считается компонента в одном потоке и по порядку: внутри цикла документ читает значения
-   * тех, кто посчитан до него на этом же обороте, и другой порядок дал бы другой итог. Но
-   * разбор от значений не зависит, поэтому тех, кого оборот пересчитает наверняка, другие
-   * потоки разбирают впереди расчёта — не больше, чем позволяет предел разом разобранных
-   * документов вместе с тем, что считается сейчас.
-   *
-   * @param serverContext рабочая область.
-   * @param component     документы компоненты.
-   * @param byDocument    отложенные методы по документам.
-   */
-  private void resolveUnloaded(
-    ServerContext serverContext,
-    List<URI> component,
-    Map<URI, List<MethodSymbol>> byDocument
-  ) {
-    // Первый оборот считает всю компоненту.
-    Set<URI> changedLastPass = new HashSet<>(component);
-    for (var pass = 0; pass < MAX_PASSES && !changedLastPass.isEmpty(); pass++) {
-      changedLastPass = resolvePass(serverContext, component, byDocument, changedLastPass);
-    }
-  }
-
-  /**
-   * Один оборот по компоненте, документы которой разом не удержать.
+   * Итог оборота тот же, что у обхода документов по порядку компоненты: документ читает
+   * значения тех, кто стоит раньше него, уже пересчитанными на этом обороте, а тех, кто
+   * позже, — с прошлого. Поэтому документ ждёт только тех, кто раньше него и связан с ним в
+   * любую сторону: на ком он построен — их новые значения ему и нужны, а кто построен на
+   * нём — тем нужно его прежнее значение. Несвязанные друг с другом считаются одновременно.
+   * Решение, пересчитывать ли документ, принимается, когда закончены все, кого он ждёт:
+   * устареть он может только от связанных с ним.
    * <p>
-   * Решение, пересчитывать ли документ, принимается, когда до него дошла очередь: он мог
-   * устареть уже на этом обороте. А впереди разбираются только те, кого оборот пересчитает
-   * наверняка, — изменившиеся на прошлом и устаревшие уже к его началу: устаревший до своей
-   * очереди устаревшим и останется.
+   * Тех, кого оборот пересчитает наверняка, — изменившихся на прошлом и устаревших уже к его
+   * началу, — свободные места в пределе разбирают впереди расчёта. Ход по такому циклу
+   * отсчитывается по документам, а не разом после последнего оборота: документы первого
+   * оборота уже в плане волны, а пересчитанные на следующих добавляются в план по мере
+   * пересчёта.
+   * <p>
+   * Обороты сцеплены без ожидания в потоках пула: оборот, начатый из задачи пула и ждущий
+   * там своих же задач, на занятом пуле не дождался бы их никогда.
    *
    * @param serverContext   рабочая область.
    * @param component       документы компоненты.
    * @param byDocument      отложенные методы по документам.
-   * @param changedLastPass документы, значения которых изменились на прошлом обороте.
-   * @return документы, значения которых изменились на этом.
+   * @param changedLastPass документы, значения которых изменились на прошлом обороте; у
+   *                        первого — все документы компоненты.
+   * @param progress        ход работы.
+   * @param pass            номер оборота, с нуля.
+   * @return окончание последнего оборота.
    */
-  private Set<URI> resolvePass(
+  private CompletableFuture<Void> resolveUnloaded(
     ServerContext serverContext,
     List<URI> component,
     Map<URI, List<MethodSymbol>> byDocument,
-    Set<URI> changedLastPass
+    Set<URI> changedLastPass,
+    ResolveProgress progress,
+    int pass
   ) {
-    var certain = component.stream()
-      .filter(uri -> changedLastPass.contains(uri) || isOutdated(uri, byDocument.get(uri)))
-      .map(uri -> byDocument.get(uri).get(0).getOwner())
-      .toList();
-    var changed = new HashSet<URI>();
-    try (var ahead = new AheadLoader(serverContext, certain)) {
-      for (var uri : component) {
-        var methods = byDocument.get(uri);
-        if ((changedLastPass.contains(uri) || isOutdated(uri, methods)) && ahead.recompute(methods)) {
-          changed.add(uri);
-        }
-      }
+    if (changedLastPass.isEmpty()) {
+      completeComponent(component);
+      return CompletableFuture.completedFuture(null);
     }
-    return changed;
+    if (pass >= MAX_PASSES) {
+      return CompletableFuture.completedFuture(null);
+    }
+    var dispatch = new PassDispatch(serverContext, component, byDocument, changedLastPass, progress, pass == 0);
+    return dispatch.start()
+      .handle((ignored, error) -> dispatch.releaseUnused().thenCompose(released -> error == null
+        ? resolveUnloaded(serverContext, component, byDocument, dispatch.changed, progress, pass + 1)
+        : CompletableFuture.<Void>failedFuture(error)))
+      .thenCompose(Function.identity());
   }
 
   /**
-   * Разбор документа, начатый впереди расчёта.
-   *
-   * @param documentContext документ.
-   * @param loaded          разобран ли документ этим разбором: тогда отпускать его тоже ему.
-   */
-  private record Preload(DocumentContext documentContext, CompletableFuture<Boolean> loaded) {
-  }
-
-  /**
-   * Разбор документов впереди расчёта на одном обороте компоненты, документы которой разом не
-   * удержать.
+   * Ход доразрешения в документах: сколько разборов запланировано и сколько сделано.
    * <p>
-   * Впереди разбираются по порядку документы, которые оборот пересчитает наверняка, — не больше
-   * {@link #MAX_DOCUMENTS_IN_MEMORY} без одного: последнее место в пределе оставлено документу,
-   * который понадобится не наверняка и разберётся на месте. Закрытие отпускает то, что разобрано
-   * впереди, но так и не понадобилось.
+   * Общий объём работы заранее не известен: волна вскрывает новые зависимости, а оборот
+   * большого цикла пересчитывает документы заново. План поэтому наращивается по мере того,
+   * как работа находится, и считается ровно то, по чему идёт отсчёт, — разборы документов,
+   * иначе числитель убегает за знаменатель.
    */
-  private final class AheadLoader implements AutoCloseable {
+  private static final class ResolveProgress {
 
-    private final ServerContext serverContext;
-    private final List<DocumentContext> certain;
-    private final Deque<Preload> ahead = new ArrayDeque<>();
-    private int next;
+    private final WorkDoneProgressHelper.WorkDoneProgressReporter reporter;
+    private final AtomicInteger planned = new AtomicInteger();
 
-    private AheadLoader(ServerContext serverContext, List<DocumentContext> certain) {
-      this.serverContext = serverContext;
-      this.certain = certain;
+    private ResolveProgress(WorkDoneProgressHelper.WorkDoneProgressReporter reporter) {
+      this.reporter = reporter;
     }
 
     /**
-     * Пересчитывает отложенные методы документа, дождавшись его разбора, если тот начат
-     * впереди, — иначе документ разобрали бы дважды.
+     * Добавить разборы в план.
      *
-     * @param methods отложенные методы одного документа.
-     * @return {@code true}, если хоть у одного метода набор типов изменился.
+     * @param documents число разборов.
      */
-    private boolean recompute(List<MethodSymbol> methods) {
-      fill();
-      var documentContext = methods.get(0).getOwner();
-      var head = ahead.peek();
-      if (head == null || !head.documentContext().equals(documentContext)) {
-        return recomputeLoading(serverContext, methods);
+    void plan(int documents) {
+      reporter.setSize(planned.addAndGet(documents));
+    }
+
+    /**
+     * Отсчитать сделанные разборы.
+     *
+     * @param documents число разборов.
+     */
+    void done(int documents) {
+      for (var i = 0; i < documents; i++) {
+        reporter.tick();
       }
-      ahead.poll();
+    }
+  }
+
+  /**
+   * Запуск работ, зависящих друг от друга, в пределе {@link #MAX_DOCUMENTS_IN_MEMORY} разом
+   * разобранных документов.
+   * <p>
+   * Работа готова, когда закончены все, от кого она зависит. Готовые запускаются по порядку
+   * номеров, пока на очередную хватает мест; следующая не обгоняет ту, на которую мест пока
+   * нет, — иначе крупная ждала бы, пока не кончатся мелкие. Раздача идёт под замком самого
+   * запуска, работы отдают своё окончание и в потоках пула ничего не ждут. Упавшая работа
+   * останавливает раздачу, а её исключение достаётся ждущему, когда закончатся начатые.
+   */
+  private abstract class Dispatch {
+
+    private static final int READY = 1;
+    private static final int RUNNING = 2;
+    private static final int DONE = 3;
+
+    /** Состояние работы: 0 — ждёт зависимостей, дальше {@link #READY}, {@link #RUNNING}, {@link #DONE}. */
+    private final int[] state;
+    private final int[] waitingFor;
+    private final int[] reserved;
+    private final boolean[] skipped;
+    private final List<List<Integer>> dependents;
+    private final PriorityQueue<Integer> ready = new PriorityQueue<>();
+    private final CompletableFuture<Void> completion = new CompletableFuture<>();
+    private int free = MAX_DOCUMENTS_IN_MEMORY;
+    private int running;
+    private int finished;
+    private boolean dispatching;
+    private boolean completed;
+    private @Nullable Throwable failure;
+
+    Dispatch(int size) {
+      state = new int[size];
+      waitingFor = new int[size];
+      reserved = new int[size];
+      skipped = new boolean[size];
+      dependents = new ArrayList<>(size);
+      for (var item = 0; item < size; item++) {
+        dependents.add(new ArrayList<>());
+      }
+    }
+
+    /**
+     * Работа {@code item} начнётся не раньше, чем закончится {@code dependency}.
+     *
+     * @param item       работа.
+     * @param dependency работа, которую она ждёт.
+     */
+    final void dependsOn(int item, int dependency) {
+      waitingFor[item]++;
+      dependents.get(dependency).add(item);
+    }
+
+    /**
+     * Нужна ли готовая работа; ненужная заканчивается, не начавшись. Спрашивается под замком.
+     *
+     * @param item работа.
+     * @return {@code true}, если её надо выполнить.
+     */
+    abstract boolean isNeeded(int item);
+
+    /**
+     * Сколько мест в пределе работа занимает, пока идёт.
+     *
+     * @param item работа.
+     * @return число мест, не больше предела.
+     */
+    abstract int places(int item);
+
+    /**
+     * Начинает работу; вызывается под замком и ждать в нём не должна.
+     *
+     * @param item работа.
+     * @return окончание работы.
+     */
+    abstract CompletableFuture<Void> perform(int item);
+
+    /**
+     * Отпускает занятое впрок за работой, которая уже не нужна. Вызывается под замком и
+     * ждать в нём не должна; место возвращается только после окончания освобождения.
+     *
+     * @param item ненужная работа.
+     * @return окончание освобождения.
+     */
+    CompletableFuture<Void> discard(int item) {
+      return CompletableFuture.completedFuture(null);
+    }
+
+    /** Раздача кончилась, а места ещё есть: их можно занять впрок, см. {@link #reserve}. */
+    void spare() {
+      // по умолчанию впрок ничего не занимается
+    }
+
+    /**
+     * Занимает место впрок за работой, которая ещё не начата: работа, начавшись, займёт на
+     * него меньше, а закончившись, вернёт и его. Вызывается под замком.
+     *
+     * @param item работа.
+     * @return {@code true}, если место нашлось.
+     */
+    final boolean reserve(int item) {
+      if (free == 0 || state[item] >= RUNNING) {
+        return false;
+      }
+      free--;
+      reserved[item]++;
+      return true;
+    }
+
+    /**
+     * Не начата ли ещё работа. Вызывается под замком.
+     *
+     * @param item работа.
+     * @return {@code true}, если работа ждёт зависимостей или места.
+     */
+    final boolean isPending(int item) {
+      return state[item] < RUNNING;
+    }
+
+    /**
+     * Начинает раздачу.
+     *
+     * @return окончание всех работ.
+     */
+    final CompletableFuture<Void> start() {
+      boolean over;
+      synchronized (this) {
+        // Сначала собрать все, кто ничего не ждёт: ненужная работа заканчивается сразу и
+        // освобождает своих зависимых, и обход по номерам застал бы их второй раз.
+        var initial = new ArrayList<Integer>();
+        for (var item = 0; item < state.length; item++) {
+          if (waitingFor[item] == 0) {
+            initial.add(item);
+          }
+        }
+        initial.forEach(this::becomeReady);
+        over = dispatch();
+      }
+      if (over) {
+        complete();
+      }
+      return completion;
+    }
+
+    private void becomeReady(int item) {
+      // Цепочка ненужных работ заканчивается здесь же, без рекурсии на каждую.
+      var next = new ArrayDeque<Integer>();
+      next.add(item);
+      while (!next.isEmpty()) {
+        var current = next.poll();
+        if (state[current] != 0) {
+          continue;
+        }
+        skipped[current] = !isNeeded(current);
+        if (!skipped[current] || reserved[current] > 0) {
+          // Занятое ненужной работой сначала отпускается тем же путём, что обычная работа:
+          // окончание освобождения вернёт место и даст ход зависимым.
+          state[current] = READY;
+          ready.add(current);
+          continue;
+        }
+        state[current] = DONE;
+        finished++;
+        for (var dependent : dependents.get(current)) {
+          if (--waitingFor[dependent] == 0) {
+            next.add(dependent);
+          }
+        }
+      }
+    }
+
+    /**
+     * Раздаёт готовые работы; вызывается под замком.
+     *
+     * @return {@code true}, если раздавать больше нечего и ничего не идёт — пора заканчивать.
+     */
+    private boolean dispatch() {
+      if (dispatching) {
+        // Работа закончилась прямо в момент запуска, в этом же потоке: раздачу продолжит
+        // внешний цикл — он и так перепроверяет очередь на каждом шаге.
+        return false;
+      }
+      dispatching = true;
       try {
-        head.loaded().join();
-        return recomputeLoading(serverContext, methods);
+        while (failure == null && !ready.isEmpty()) {
+          int item = ready.peek();
+          var need = places(item) - reserved[item];
+          if (need > free) {
+            break;
+          }
+          ready.poll();
+          free -= need;
+          launch(item);
+        }
+        if (failure == null) {
+          spare();
+        }
       } finally {
-        release(head);
+        dispatching = false;
+      }
+      var over = !completed && running == 0 && (failure != null || ready.isEmpty());
+      completed |= over;
+      return over;
+    }
+
+    private void launch(int item) {
+      state[item] = RUNNING;
+      running++;
+      CompletableFuture<Void> work;
+      try {
+        work = skipped[item] ? discard(item) : perform(item);
+      } catch (RejectedExecutionException e) {
+        running--;
+        free += places(item);
+        failure = e;
+        return;
+      }
+      work.whenComplete((ignored, error) -> finish(item, error));
+    }
+
+    private void finish(int item, @Nullable Throwable error) {
+      boolean over;
+      synchronized (this) {
+        running--;
+        free += places(item);
+        state[item] = DONE;
+        finished++;
+        if (error != null) {
+          if (failure == null) {
+            failure = error;
+          }
+        } else {
+          for (var dependent : dependents.get(item)) {
+            if (--waitingFor[dependent] == 0) {
+              becomeReady(dependent);
+            }
+          }
+        }
+        over = dispatch();
+      }
+      if (over) {
+        complete();
       }
     }
 
-    private void fill() {
-      while (next < certain.size() && ahead.size() < MAX_DOCUMENTS_IN_MEMORY - 1) {
-        ahead.add(preload(certain.get(next)));
-        next++;
+    private void complete() {
+      Throwable error;
+      int done;
+      synchronized (this) {
+        error = failure;
+        done = finished;
+      }
+      if (error != null) {
+        completion.completeExceptionally(error);
+      } else if (done < state.length) {
+        completion.completeExceptionally(new IllegalStateException(
+          "Resolve dispatch stalled: finished " + done + " of " + state.length));
+      } else {
+        completion.complete(null);
+      }
+    }
+  }
+
+  /**
+   * Компоненты волны: компонента ждёт компоненты, на документах которых построены её
+   * документы, и занимает в пределе по месту на документ.
+   */
+  private final class ComponentDispatch extends Dispatch {
+
+    private final ServerContext serverContext;
+    private final List<List<URI>> components;
+    private final Map<URI, List<MethodSymbol>> byDocument;
+    private final ResolveProgress progress;
+
+    private ComponentDispatch(
+      ServerContext serverContext,
+      List<List<URI>> components,
+      Map<URI, List<MethodSymbol>> byDocument,
+      ResolveProgress progress
+    ) {
+      super(components.size());
+      this.serverContext = serverContext;
+      this.components = components;
+      this.byDocument = byDocument;
+      this.progress = progress;
+      var componentOf = new HashMap<URI, Integer>();
+      for (var index = 0; index < components.size(); index++) {
+        for (var uri : components.get(index)) {
+          componentOf.put(uri, index);
+        }
+      }
+      for (var index = 0; index < components.size(); index++) {
+        var dependencies = new HashSet<Integer>();
+        for (var uri : components.get(index)) {
+          for (var dependency : dependenciesByUri.getOrDefault(uri, Set.of())) {
+            var other = componentOf.get(dependency);
+            if (other != null && other != index && dependencies.add(other)) {
+              dependsOn(index, other);
+            }
+          }
+        }
       }
     }
 
-    private Preload preload(DocumentContext documentContext) {
-      var loaded = CompletableFuture
-        .supplyAsync(() -> loadIfReleased(documentContext), resolveReturnTypesExecutor)
-        .exceptionally((Throwable e) -> {
-          // Не разобрался впереди — разберётся на месте, как без этого разбора.
-          LOGGER.warn("Can't preload document {}", documentContext.getUri(), e);
-          return false;
+    @Override
+    boolean isNeeded(int item) {
+      return true;
+    }
+
+    @Override
+    int places(int item) {
+      return Math.min(components.get(item).size(), MAX_DOCUMENTS_IN_MEMORY);
+    }
+
+    @Override
+    CompletableFuture<Void> perform(int item) {
+      var component = components.get(item);
+      if (component.size() > MAX_DOCUMENTS_IN_MEMORY) {
+        return resolveUnloaded(serverContext, component, byDocument, new HashSet<>(component), progress, 0);
+      }
+      return CompletableFuture.runAsync(
+        () -> resolveComponent(serverContext, component, byDocument, progress),
+        resolveReturnTypesExecutor);
+    }
+  }
+
+  /**
+   * Один оборот по компоненте, документы которой разом не удержать (см. {@code resolveUnloaded}).
+   * Работа — документ компоненты, номер — его место в порядке компоненты.
+   */
+  private final class PassDispatch extends Dispatch {
+
+    private final ServerContext serverContext;
+    private final List<URI> component;
+    private final Map<URI, List<MethodSymbol>> byDocument;
+    private final Set<URI> changedLastPass;
+    private final ResolveProgress progress;
+    private final boolean planned;
+    private final List<Integer> certain = new ArrayList<>();
+    private final Map<Integer, CompletableFuture<Boolean>> preloads = new HashMap<>();
+    private final Set<URI> changed = ConcurrentHashMap.newKeySet();
+    private int nextCertain;
+
+    private PassDispatch(
+      ServerContext serverContext,
+      List<URI> component,
+      Map<URI, List<MethodSymbol>> byDocument,
+      Set<URI> changedLastPass,
+      ResolveProgress progress,
+      boolean planned
+    ) {
+      super(component.size());
+      this.serverContext = serverContext;
+      this.component = component;
+      this.byDocument = byDocument;
+      this.changedLastPass = changedLastPass;
+      this.progress = progress;
+      this.planned = planned;
+      var indexOf = new HashMap<URI, Integer>();
+      for (var index = 0; index < component.size(); index++) {
+        indexOf.put(component.get(index), index);
+      }
+      for (var index = 0; index < component.size(); index++) {
+        var uri = component.get(index);
+        var earlier = new HashSet<Integer>();
+        for (var related : List.of(
+          dependenciesByUri.getOrDefault(uri, Set.of()),
+          dependentsByUri.getOrDefault(uri, Set.of()))) {
+          for (var other : related) {
+            var otherIndex = indexOf.get(other);
+            if (otherIndex != null && otherIndex < index && earlier.add(otherIndex)) {
+              dependsOn(index, otherIndex);
+            }
+          }
+        }
+        if (changedLastPass.contains(uri) || isOutdated(uri, byDocument.get(uri))) {
+          certain.add(index);
+        }
+      }
+    }
+
+    @Override
+    boolean isNeeded(int item) {
+      var uri = component.get(item);
+      var needed = changedLastPass.contains(uri) || isOutdated(uri, byDocument.get(uri));
+      if (needed && !planned) {
+        progress.plan(1);
+      }
+      return needed;
+    }
+
+    @Override
+    int places(int item) {
+      return 1;
+    }
+
+    @Override
+    CompletableFuture<Void> discard(int item) {
+      var owner = byDocument.get(component.get(item)).get(0).getOwner();
+      // Освобождение берёт замок документа, поэтому не выполняется под замком раздачи.
+      // Запись остаётся до успеха: при отказе пула её подхватит releaseUnused.
+      return preloads.get(item)
+        .thenAcceptAsync(loaded -> release(owner, loaded), resolveReturnTypesExecutor)
+        .thenRun(() -> {
+          synchronized (this) {
+            preloads.remove(item);
+          }
         });
-      return new Preload(documentContext, loaded);
+    }
+
+    @Override
+    CompletableFuture<Void> perform(int item) {
+      var uri = component.get(item);
+      var methods = byDocument.get(uri);
+      var owner = methods.get(0).getOwner();
+      // Разбор впереди уже идёт — расчёт ждёт его, иначе документ разобрали бы дважды. Не начат —
+      // документ разбирается тем же путём на своём месте: сбой такого разбора не валит оборот, а
+      // повторяется на месте при расчёте.
+      var ahead = preloads.remove(item);
+      var loaded = ahead != null ? ahead : preload(owner);
+      return loaded
+        .thenAcceptAsync(ignored -> {
+          if (recomputeLoading(serverContext, methods)) {
+            changed.add(uri);
+          }
+        }, resolveReturnTypesExecutor)
+        .whenComplete((ignored, error) -> {
+          release(owner, loaded.getNow(false));
+          progress.done(1);
+        });
+    }
+
+    /**
+     * Свободные места занимаются впрок разбором тех, кого оборот пересчитает наверняка, по
+     * порядку компоненты. Не больше предела без одного: последнее место остаётся документу,
+     * который понадобится не наверняка, — иначе места могли бы занять разборы впереди,
+     * ждущие его самого.
+     */
+    @Override
+    void spare() {
+      while (preloads.size() < MAX_DOCUMENTS_IN_MEMORY - 1 && nextCertain < certain.size()) {
+        int item = certain.get(nextCertain);
+        if (!isPending(item)) {
+          nextCertain++;
+          continue;
+        }
+        if (!reserve(item)) {
+          return;
+        }
+        nextCertain++;
+        preloads.put(item, preload(byDocument.get(component.get(item)).get(0).getOwner()));
+      }
+    }
+
+    /**
+     * Отпускает разобранное впереди, но так и не понадобившееся: так бывает, если оборот упал.
+     *
+     * @return окончание освобождения.
+     */
+    private CompletableFuture<Void> releaseUnused() {
+      List<Map.Entry<Integer, CompletableFuture<Boolean>>> unused;
+      synchronized (this) {
+        unused = List.copyOf(preloads.entrySet());
+        preloads.clear();
+      }
+      return CompletableFuture.allOf(unused.stream()
+        .map(entry -> entry.getValue().thenAccept(loaded ->
+          release(byDocument.get(component.get(entry.getKey())).get(0).getOwner(), loaded)))
+        .toArray(CompletableFuture[]::new));
+    }
+
+    private CompletableFuture<Boolean> preload(DocumentContext documentContext) {
+      try {
+        return CompletableFuture
+          .supplyAsync(() -> loadIfReleased(documentContext), resolveReturnTypesExecutor)
+          .exceptionally((Throwable e) -> {
+            // Не разобрался впереди — разберётся на месте, как без этого разбора.
+            LOGGER.warn("Can't preload document {}", documentContext.getUri(), e);
+            return false;
+          });
+      } catch (RejectedExecutionException e) {
+        return CompletableFuture.completedFuture(false);
+      }
     }
 
     /**
@@ -963,8 +1610,7 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
         if (isReadable(documentContext)) {
           return false;
         }
-        rebuilt.incrementAndGet();
-        rebuiltUris.add(documentContext.getUri());
+        rebuilds.recordReload(documentContext.getUri());
         serverContext.rebuildDocument(documentContext);
         // Файл мог не прочитаться: тогда документ не разобран, и отпускать его нечего.
         return isReadable(documentContext);
@@ -973,11 +1619,16 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
       }
     }
 
-    private void release(Preload preload) {
-      if (!Boolean.TRUE.equals(preload.loaded().join())) {
+    /**
+     * Отпускает документ, разобранный впереди.
+     *
+     * @param documentContext документ.
+     * @param loaded          разобран ли он разбором впереди: иначе отпускать его не этому.
+     */
+    private void release(DocumentContext documentContext, boolean loaded) {
+      if (!loaded) {
         return;
       }
-      var documentContext = preload.documentContext();
       var lock = serverContext.getDocumentLock(documentContext.getUri()).writeLock();
       lock.lock();
       try {
@@ -985,11 +1636,6 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
       } finally {
         lock.unlock();
       }
-    }
-
-    @Override
-    public void close() {
-      ahead.forEach(this::release);
     }
   }
 
@@ -1041,8 +1687,7 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
         serverContext.getDocumentLock(uri).writeLock().lock();
         locked.add(uri);
         if (!isReadable(documentContext)) {
-          rebuilt.incrementAndGet();
-          rebuiltUris.add(uri);
+          rebuilds.recordReload(uri);
           serverContext.rebuildDocument(documentContext);
           loaded.add(documentContext);
         }
@@ -1091,8 +1736,7 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
       if (isReadable(documentContext)) {
         return recomputeEach(methods);
       }
-      rebuilt.incrementAndGet();
-      rebuiltUris.add(documentContext.getUri());
+      rebuilds.recordReload(documentContext.getUri());
       // Разбор сам пересчитает экспортные методы документа по событию, а неэкспортные,
       // до которых дошла очередь, пересчитываются явно.
       serverContext.rebuildDocument(documentContext);
@@ -1123,8 +1767,21 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
    * @return {@code true}, если хоть у одного набор типов изменился.
    */
   private boolean recomputeEach(List<MethodSymbol> methods) {
+    var generation = awaitGeneration();
+    if (generation == null) {
+      return false;
+    }
     var before = methods.stream().map(symbolTypeIndex::getReturnTypes).toList();
-    provisional.addAll(methods);
+    var exclusive = publication.gate.writeLock();
+    exclusive.lock();
+    try {
+      if (configurationGeneration() == generation) {
+        methods.forEach(method -> publication.provisional.put(new MethodDeclarationKey(method),
+          new ProvisionalReturn(UNSCOPED_INPUTS, null, null)));
+      }
+    } finally {
+      exclusive.unlock();
+    }
     for (var method : methods) {
       // Пометка «посчитан» не снимается: пересчёт и так идёт напрямую, а без пометки
       // соседний метод, читающий этот прямо сейчас, счёл бы его непосчитанным и снова
@@ -1220,6 +1877,166 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
     return Resources.getResourceString(globalConfiguration.getLanguage(), getClass(), key);
   }
 
+  /** Завершить стабильные циклы, чья единственная недостающая информация находится внутри компоненты. */
+  private void completeComponent(List<URI> component) {
+    // Снимок читает computedAt; во время публикации его слот уже удерживается.
+    finalizeComponent(component, componentCandidates(component));
+  }
+
+  private void finalizeComponent(List<URI> component, Map<MethodDeclarationKey, ProvisionalReturn> candidates) {
+    if (candidates.isEmpty()) {
+      return;
+    }
+    var dependencies = componentDependencies(component, candidates);
+    var exclusive = publication.gate.writeLock();
+    exclusive.lock();
+    try {
+      // Новые публикации не начнутся. Активные методы пропускаем вместе с их потребителями.
+      removeCompletedCandidates(candidates, dependencies);
+    } finally {
+      exclusive.unlock();
+    }
+  }
+
+  /** Граф строится по снимку: актуальность его записей проверяется только при завершении. */
+  private static ComponentDependencies componentDependencies(
+    List<URI> component, Map<MethodDeclarationKey, ProvisionalReturn> candidates) {
+    var members = Set.copyOf(component);
+    var dependents = new HashMap<MethodDeclarationKey, List<MethodDeclarationKey>>();
+    var externalInputs = new HashMap<MethodDeclarationKey, List<MethodDeclarationKey>>();
+    var blocked = new ArrayDeque<MethodDeclarationKey>();
+    for (var entry : candidates.entrySet()) {
+      var declaration = entry.getKey();
+      for (var dependency : java.util.Objects.requireNonNull(entry.getValue().missingMethods)) {
+        if (!members.contains(dependency.getOwner().getUri())) {
+          blocked.add(declaration);
+        } else {
+          var key = new MethodDeclarationKey(dependency);
+          var edges = candidates.containsKey(key) ? dependents : externalInputs;
+          edges.computeIfAbsent(key, ignored -> new ArrayList<>()).add(declaration);
+        }
+      }
+    }
+    return new ComponentDependencies(dependents, externalInputs, blocked);
+  }
+
+  private void removeCompletedCandidates(Map<MethodDeclarationKey, ProvisionalReturn> candidates,
+                                         ComponentDependencies dependencies) {
+    var blocked = dependencies.blocked();
+    candidates.forEach((MethodDeclarationKey declaration, ProvisionalReturn candidate) -> {
+      if (!isCurrentIndexedCandidate(declaration, candidate)) {
+        blocked.add(declaration);
+      }
+    });
+    dependencies.externalInputs().forEach((MethodDeclarationKey input, List<MethodDeclarationKey> dependents) -> {
+      if (publication.inProgress.contains(input) || !isIndexed(input.method())) {
+        blocked.addAll(dependents);
+      }
+    });
+    while (!blocked.isEmpty()) {
+      var method = blocked.removeFirst();
+      if (candidates.remove(method) != null) {
+        blocked.addAll(dependencies.dependents().getOrDefault(method, List.of()));
+      }
+    }
+    candidates.forEach(publication.provisional::remove);
+  }
+
+  private boolean isCurrentIndexedCandidate(MethodDeclarationKey declaration, ProvisionalReturn candidate) {
+    return !publication.inProgress.contains(declaration)
+      && publication.provisional.get(declaration) == candidate
+      && indexed.contains(declaration.method());
+  }
+
+  private record ComponentDependencies(Map<MethodDeclarationKey, List<MethodDeclarationKey>> dependents,
+                                       Map<MethodDeclarationKey, List<MethodDeclarationKey>> externalInputs,
+                                       ArrayDeque<MethodDeclarationKey> blocked) {
+  }
+
+
+  private Map<MethodDeclarationKey, ProvisionalReturn> componentCandidates(List<URI> component) {
+    Map<MethodDeclarationKey, ProvisionalReturn> candidates = new HashMap<>();
+    for (var uri : component) {
+      for (var method : methodsByUri.getOrDefault(uri, List.of())) {
+        computedAt.computeIfPresent(method, (MethodSymbol key, Long startedAt) -> {
+          var declaration = new MethodDeclarationKey(key);
+          var observed = publication.provisional.get(declaration);
+          if (indexed.contains(key) && observed != null && observed.missingMethods != null
+            && !observed.missingMethods.isEmpty()) {
+            candidates.put(declaration, observed);
+          }
+          return startedAt;
+        });
+      }
+    }
+    return candidates;
+  }
+
+  private static final class ReturnPublication {
+    /** Разделяемый допуск публикаций, исключительный доступ для сброса и завершения компоненты. */
+    private final ReentrantReadWriteLock gate = new ReentrantReadWriteLock();
+    private final Condition changed = gate.writeLock().newCondition();
+
+    private final AtomicReference<ConfigurationGeneration> generation =
+      new AtomicReference<>(new ConfigurationGeneration(true));
+    private final Map<MethodDeclarationKey, ProvisionalReturn> provisional = new ConcurrentHashMap<>();
+
+    /** Запись добавляется при допуске, снимается после последнего изменения результата. */
+    private final Set<MethodDeclarationKey> inProgress = ConcurrentHashMap.newKeySet();
+  }
+
+  /** Непрозрачный токен поколения настроек индекса. */
+  public static final class ConfigurationGeneration {
+    private static final ConfigurationGeneration RESETTING = new ConfigurationGeneration(false);
+    private volatile boolean current;
+
+    private ConfigurationGeneration(boolean current) {
+      this.current = current;
+    }
+
+    /**
+     * Действует ли это поколение для полученного результата в момент проверки.
+     *
+     * @return {@code false}, если уже начинается очистка старого состояния.
+     */
+    public boolean isCurrent() {
+      return current;
+    }
+  }
+
+  private enum StoreResult {
+    CHANGED,
+    UNCHANGED,
+    DISCARDED
+  }
+
+
+  /** Запись сравнивается по идентичности, чтобы завершение не снимало более новую предварительную версию. */
+  private static final class ProvisionalReturn {
+    private final Object inputs;
+    private final @Nullable Set<MethodSymbol> missingMethods;
+    private final @Nullable ReusedReturnTypes reused;
+
+    private ProvisionalReturn(Object inputs, @Nullable Set<MethodSymbol> missingMethods,
+                              @Nullable ReusedReturnTypes reused) {
+      this.inputs = inputs;
+      this.missingMethods = missingMethods;
+      this.reused = reused;
+    }
+
+    private @Nullable ReusedReturnTypes estimateFor(Object inputs) {
+      return this.inputs == inputs ? reused : null;
+    }
+  }
+
+  /** Новый расчёт либо ранее опубликованное предварительное значение с совпавшим ключом. */
+  public sealed interface OnDemandReturnTypes permits ComputedReturnTypes, ReusedReturnTypes {
+    TypeSet types();
+  }
+
+  private record ReusedReturnTypes(TypeSet types) implements OnDemandReturnTypes {
+  }
+
   /**
    * Результат расчёта типов возврата метода.
    *
@@ -1227,7 +2044,21 @@ public class MethodReturnTypeIndexer extends AbstractDocumentLifecycleClearableI
    * @param consulted  методы, значения которых участвовали в расчёте.
    * @param incomplete расчёт обращался к методу, значение которого ещё не посчитано, —
    *                   значит его надо повторить, когда рабочая область будет наполнена.
+   * @param incompleteMethodReturns все незавершённые входы, если неполнота вызвана только возвратами
+   *                                этих функций; {@code null} сохраняет прочие либо неизвестные причины.
    */
-  public record ComputedReturnTypes(TypeSet types, Set<MethodSymbol> consulted, boolean incomplete) {
+  public record ComputedReturnTypes(TypeSet types, Set<MethodSymbol> consulted, boolean incomplete,
+                                    @Nullable Set<MethodSymbol> incompleteMethodReturns)
+    implements OnDemandReturnTypes {
+    public ComputedReturnTypes {
+      if (incompleteMethodReturns != null) {
+        incompleteMethodReturns = Set.copyOf(incompleteMethodReturns);
+      }
+    }
+
+    /** Прежний контракт без уточнения причины неполноты не разрешает завершать цикл по предположению. */
+    public ComputedReturnTypes(TypeSet types, Set<MethodSymbol> consulted, boolean incomplete) {
+      this(types, consulted, incomplete, incomplete ? null : Set.of());
+    }
   }
 }

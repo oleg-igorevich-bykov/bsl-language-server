@@ -46,6 +46,8 @@ import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
@@ -197,7 +199,7 @@ class EventHandlerResolverTest {
 
   @Test
   void commandModuleResolvesViaFixedOwnerType() {
-    // CommandModule идёт через MODULE_TYPE_TO_FIXED_OWNER_RU = "Модуль команды".
+    // Контракт берётся из платформенного типа модуля команды.
     var commandRef = new TypeRef(TypeKind.PLATFORM, "Модуль команды");
     when(typeRegistry.resolve("Модуль команды")).thenReturn(Optional.of(commandRef));
     var eventDescriptor = MemberDescriptor.event(
@@ -212,6 +214,38 @@ class EventHandlerResolverTest {
 
     assertThat(resolver.lookupContract(doc, "ОбработкаКоманды")).isPresent();
     assertThat(resolver.lookupContract(doc, "ЧтоТоЕщё")).isEmpty();
+  }
+
+  @Test
+  void webSocketModuleResolvesEventsFromItsPlatformType() {
+    var moduleRef = new TypeRef(TypeKind.PLATFORM, "Модуль WebSocket клиента");
+    when(typeRegistry.resolve(moduleRef.qualifiedName())).thenReturn(Optional.of(moduleRef));
+    var event = MemberDescriptor.event("ПриПолученииСообщения", "",
+      List.of(new SignatureDescriptor(List.of(), TypeSet.EMPTY, "")));
+    when(typeRegistry.getMembers(moduleRef, FileType.BSL)).thenReturn(List.of(event));
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.WEBSocketClientModule);
+    when(doc.getFileType()).thenReturn(FileType.BSL);
+
+    assertThat(resolver.lookupContract(doc, "ПриПолученииСообщения")).contains(event);
+    assertThat(resolver.eventOwnerTypeRef(doc)).contains(moduleRef);
+    assertThat(resolver.allEvents(doc)).containsExactly(event);
+  }
+
+  @Test
+  void recalculationModuleResolvesEventsOfItsRecordSet() {
+    var moduleRef = new TypeRef(TypeKind.CONFIGURATION, "ПерерасчетНаборЗаписей.Начисления");
+    when(typeRegistry.resolve(moduleRef.qualifiedName())).thenReturn(Optional.of(moduleRef));
+    var event = MemberDescriptor.event("ПередЗаписью", "", List.of());
+    when(typeRegistry.getMembers(moduleRef, FileType.BSL)).thenReturn(List.of(event));
+    var md = com.github._1c_syntax.bsl.mdo.children.Recalculation.builder().name("Начисления").build();
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.RecalculationModule);
+    when(doc.getMdObject()).thenReturn(Optional.of(md));
+    when(doc.getFileType()).thenReturn(FileType.BSL);
+
+    assertThat(resolver.lookupContract(doc, "ПередЗаписью")).contains(event);
+    assertThat(resolver.eventOwnerTypeRef(doc)).contains(moduleRef);
   }
 
   @Test
@@ -250,6 +284,59 @@ class EventHandlerResolverTest {
 
     // when, then
     assertThat(resolver.lookupContract(doc, "Загрузить")).isPresent();
+  }
+
+  @Test
+  void eventHandlersOfAnswersAsIsEventHandlerAndReadsMembersOnce() {
+    // given
+    var commandRef = new TypeRef(TypeKind.PLATFORM, "Модуль команды");
+    when(typeRegistry.resolve("Модуль команды")).thenReturn(Optional.of(commandRef));
+    when(typeRegistry.getMembers(eq(commandRef), any())).thenReturn(List.of(
+      MemberDescriptor.event("ОбработкаКоманды", "",
+        List.of(new SignatureDescriptor(List.of(), TypeSet.EMPTY, "")))));
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.CommandModule);
+    when(doc.getFileType()).thenReturn(FileType.BSL);
+
+    // when
+    var eventHandlers = resolver.eventHandlersOf(doc);
+
+    // then: ответы те же, что у isEventHandler, а владелец и его члены найдены один раз на документ
+    assertThat(eventHandlers.test("ОбработкаКоманды")).isTrue();
+    assertThat(eventHandlers.test("ЧтоТоЕщё")).isFalse();
+    assertThat(eventHandlers.test("ОбработкаКоманды")).isTrue();
+    verify(typeRegistry, times(1)).getMembers(eq(commandRef), any());
+  }
+
+  @Test
+  void eventHandlersOfWebServiceModuleTakesItsOwnService() {
+    // given
+    var serviceRef = new TypeRef(TypeKind.PLATFORM, "Модуль Web-сервиса.Обмен");
+    when(typeRegistry.resolve("Модуль Web-сервиса.Обмен")).thenReturn(Optional.of(serviceRef));
+    when(typeRegistry.getMembers(eq(serviceRef), any())).thenReturn(List.of(
+      MemberDescriptor.event("Загрузить", "",
+        List.of(new SignatureDescriptor(List.of(), TypeSet.EMPTY, "")))));
+
+    // when
+    var eventHandlers = resolver.eventHandlersOf(webServiceModuleDoc("Обмен"));
+
+    // then
+    assertThat(eventHandlers.test("Загрузить")).isTrue();
+    assertThat(eventHandlers.test("Выгрузить")).isFalse();
+  }
+
+  @Test
+  void eventHandlersOfOScriptClassUsesFixedEvents() {
+    // given
+    var doc = mock(DocumentContext.class);
+    when(doc.getModuleType()).thenReturn(ModuleType.OScriptClass);
+
+    // when
+    var eventHandlers = resolver.eventHandlersOf(doc);
+
+    // then
+    assertThat(eventHandlers.test("ПриСозданииОбъекта")).isTrue();
+    assertThat(eventHandlers.test("СлучайныйМетод")).isFalse();
   }
 
   private static DocumentContext webServiceModuleDoc(String serviceName) {

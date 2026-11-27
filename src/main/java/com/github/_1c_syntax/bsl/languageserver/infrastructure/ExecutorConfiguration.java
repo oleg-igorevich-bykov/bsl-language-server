@@ -29,10 +29,12 @@ import org.springframework.core.task.AsyncTaskExecutor;
 import org.springframework.core.task.SimpleAsyncTaskExecutor;
 import org.springframework.core.task.TaskDecorator;
 import org.springframework.core.task.support.ContextPropagatingTaskDecorator;
+import org.springframework.scheduling.annotation.EnableAsync;
 
 import java.net.URI;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinWorkerThread;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -56,8 +58,13 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Остальные исполнители — короткоживущие обработчики запросов LSP без {@code parallelStream()}
  * внутри — реализуются через {@link SimpleAsyncTaskExecutor} в режиме виртуальных потоков
  * ({@code setVirtualThreads(true)}) с {@link TaskDecorator} для прокидывания контекста.
+ * <p>
+ * Методы с {@code @Async} исполняются на исполнителе, названном в аннотации. Исполнитель по
+ * умолчанию не настроен: {@code @Async} без имени ушёл бы на исполнитель, который Spring
+ * выберет сам, и без контекста workspace.
  */
 @Configuration
+@EnableAsync(proxyTargetClass = true)
 public class ExecutorConfiguration {
 
   @Bean
@@ -99,6 +106,12 @@ public class ExecutorConfiguration {
   @Bean
   public AsyncTaskExecutor sentryExecutor(TaskDecorator compositeTaskDecorator) {
     return createVirtualThreadExecutor(compositeTaskDecorator, "sentry-");
+  }
+
+  // Асинхронные обработчики событий: @Async("asyncEventListenerExecutor").
+  @Bean
+  public AsyncTaskExecutor asyncEventListenerExecutor(TaskDecorator compositeTaskDecorator) {
+    return createVirtualThreadExecutor(compositeTaskDecorator, "async-event-listener-");
   }
 
   // --- ForkJoinPool beans (parallelStream runs inside) ---
@@ -153,6 +166,17 @@ public class ExecutorConfiguration {
   @WorkspaceScope(proxyMode = ScopedProxyMode.INTERFACES)
   public ExecutorService cliExecutor() {
     return createWorkspaceForkJoinPool("cli-");
+  }
+
+  // reportWriteExecutor — ровно один поток: задачи записи отчётов исполняются по порядку, и
+  // репортёры пишут в свои генераторы без синхронизации. Очередь не ограничена: постановка
+  // задачи не ждёт записи. Контекст workspace постановщика несёт ContextPropagatingExecutorService
+  // (per-task).
+  @Bean(destroyMethod = "shutdown")
+  public ExecutorService reportWriteExecutor() {
+    return new ContextPropagatingExecutorService(
+      Executors.newSingleThreadExecutor(new NamedThreadFactory("report-write-"))
+    );
   }
 
   private static AsyncTaskExecutor createVirtualThreadExecutor(

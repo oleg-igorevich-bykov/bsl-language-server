@@ -23,6 +23,7 @@ package com.github._1c_syntax.bsl.languageserver.types.index;
 
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
 import com.github._1c_syntax.bsl.languageserver.context.FileType;
+import com.github._1c_syntax.bsl.languageserver.context.events.DocumentContextConfigurationBindingChangedEvent;
 import com.github._1c_syntax.bsl.languageserver.context.events.DocumentContextContentChangedEvent;
 import com.github._1c_syntax.bsl.languageserver.context.events.ServerContextPopulatedEvent;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.MethodSymbol;
@@ -162,6 +163,16 @@ public class SymbolTypeIndex {
     reindexDeclared(documentContext);
   }
 
+  // Символы документа построены заново, а методы нового дерева не равны прежним, если сменился
+  // их вид, — по старым записям их уже не найти. Порядок тот же, что у правки.
+  @Order(200)
+  @EventListener
+  public void handleEvent(DocumentContextConfigurationBindingChangedEvent event) {
+    var documentContext = event.getSource();
+    clear(documentContext.getUri());
+    reindexDeclared(documentContext);
+  }
+
   /**
    * Пересобирает объявленные типы возвращаемых значений по всей рабочей области.
    * <p>
@@ -244,6 +255,22 @@ public class SymbolTypeIndex {
    */
   public TypeSet getDeclaredReturnTypes(MethodSymbol method) {
     return declaredReturnTypes.getOrDefault(method, TypeSet.EMPTY);
+  }
+
+  /**
+   * Соединить тип из документирующего комментария с переданным результатом вывода.
+   * <p>
+   * Применяет те же правила, что {@link #getReturnTypes(MethodSymbol)}: для совпавшего
+   * типа сохраняется уточнение из комментария, а известные поля дополняются из вывода.
+   * Общий индекс и его кеш объединений не изменяются, поэтому метод подходит для результата,
+   * посчитанного только в одном контексте компиляции.
+   *
+   * @param method метод, чей документирующий комментарий нужно учесть.
+   * @param inferred отдельный результат вывода по телу, в том числе пустой.
+   * @return объединённый тип; пустой набор, если оба источника пусты.
+   */
+  public TypeSet getReturnTypes(MethodSymbol method, TypeSet inferred) {
+    return combine(getDeclaredReturnTypes(method), inferred);
   }
 
   /**
@@ -453,6 +480,21 @@ public class SymbolTypeIndex {
       || (type instanceof CollectionTypeDescription collection
       && anyAwaitsUnparsedModule(collection.valueTypes(), owner, visited))
       || anyFieldAwaitsUnparsedModule(type.fields(), owner, visited);
+  }
+
+  /**
+   * Ведёт ли ссылка {@code См.} в модуль, до разбора которого очередь ещё не дошла, — сама
+   * либо через описание функции, на которую указывает.
+   * <p>
+   * Пока рабочая область наполняется, такая ссылка не разрешается ни во что, и
+   * {@link #resolveSeeReference} отвечает пустотой, ничем не отличимой от честной.
+   *
+   * @param link  текст ссылки; ссылка без точки ведёт на функцию своего модуля.
+   * @param owner документ, в котором стоит ссылка.
+   * @return {@code true}, если ссылка ведёт в ещё не разобранный модуль.
+   */
+  public boolean linkAwaitsUnparsedModule(@Nullable String link, DocumentContext owner) {
+    return linkAwaitsUnparsedModule(link, owner, new HashSet<>());
   }
 
   /**
@@ -747,6 +789,15 @@ public class SymbolTypeIndex {
       declaredReturnTypes.remove(m);
       combinedReturnTypes.remove(m);
     }
+  }
+
+  /** Сбросить результаты расчёта по телам при смене режимов, сохранив типы из описаний. */
+  public void clearInferredReturnTypes() {
+    inferredByUri.keySet().forEach(uri -> inferredByUri.computeIfPresent(uri, (key, methods) -> {
+      methods.forEach(inferredReturnTypes::remove);
+      return null;
+    }));
+    combinedReturnTypes.clear();
   }
 
   private void indexMethodsRecursive(SourceDefinedSymbol parent, List<MethodSymbol> collected) {

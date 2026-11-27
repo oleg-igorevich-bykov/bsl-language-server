@@ -35,6 +35,7 @@ import com.github._1c_syntax.bsl.languageserver.references.model.Symbol;
 import com.github._1c_syntax.bsl.languageserver.references.model.SymbolOccurrence;
 import com.github._1c_syntax.bsl.languageserver.references.model.SymbolOccurrenceRepository;
 import com.github._1c_syntax.bsl.types.ModuleType;
+import com.github._1c_syntax.utils.GenericInterner;
 import com.github._1c_syntax.utils.StringInterner;
 import lombok.RequiredArgsConstructor;
 import org.eclipse.lsp4j.Position;
@@ -51,6 +52,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Индекс ссылок на символы в проекте.
@@ -74,6 +76,7 @@ public class ReferenceIndex {
 
   private final ServerContextProvider serverContextProvider;
   private final StringInterner stringInterner;
+  private final GenericInterner<Symbol> referenceSymbolInterner;
   private final LocationRepository locationRepository;
   private final SymbolOccurrenceRepository symbolOccurrenceRepository;
   private final SelfMemberResolver selfMemberResolver;
@@ -124,6 +127,37 @@ public class ReferenceIndex {
   }
 
   /**
+   * Цель ссылки без данных места обращения.
+   *
+   * @param uri URI документа.
+   * @param position позиция обращения.
+   * @return доступный символ по тем же правилам, что и {@link #getReference}.
+   */
+  public Optional<com.github._1c_syntax.bsl.languageserver.context.symbol.Symbol> getTargetSymbol(
+    URI uri, Position position) {
+    return locationRepository.findByPosition(uri, position).flatMap(this::targetSymbolOf);
+  }
+
+  private Optional<com.github._1c_syntax.bsl.languageserver.context.symbol.Symbol> targetSymbolOf(
+    SymbolOccurrence occurrence) {
+    var server = serverContextProvider.getServerContext(occurrence.uri()).orElse(null);
+    if (server == null) {
+      return Optional.empty();
+    }
+    var fromOwner = server.getDocumentNoLock(occurrence.uri());
+    if (fromOwner == null) {
+      return Optional.empty();
+    }
+    if (SELF_MEMBER_SCOPE.equals(occurrence.symbol().scopeName())) {
+      return selfMemberResolver.resolveSelfMember(fromOwner, occurrence.symbol().symbolKind(),
+        occurrence.symbol().symbolName());
+    }
+    return getSourceDefinedSymbol(server, occurrence.symbol())
+      .filter(target -> ReferenceAccessibility.isAccessible(fromOwner, target))
+      .map(target -> target);
+  }
+
+  /**
    * Поиск ссылок на символы в документе.
    *
    * @param uri URI документа, в котором нужно найти ссылки на другие символы.
@@ -165,6 +199,22 @@ public class ReferenceIndex {
   }
 
   /**
+   * Ключи локальных переменных в текущем снимке вхождений документа.
+   * <p>
+   * Поток не восстанавливает ссылки и не обращается к AST. Повторные использования переменной
+   * могут вернуть один ключ несколько раз; его канонизация остаётся на стороне вызывающего кода.
+   *
+   * @param uri нормализованный URI документа.
+   * @return поток ключей переменных с областью метода, без модульных переменных и self-членов.
+   */
+  Stream<Symbol> getLocalVariableKeys(URI uri) {
+    return locationRepository.getSymbolOccurrencesByLocationUri(uri)
+      .map(SymbolOccurrence::symbol)
+      .filter(symbol -> symbol.symbolKind() == SymbolKind.Variable && !symbol.scopeName().isEmpty()
+        && !SELF_MEMBER_SCOPE.equals(symbol.scopeName()));
+  }
+
+  /**
    * Очистить ссылки из/на текущий документ.
    *
    * @param uri URI документа.
@@ -184,6 +234,7 @@ public class ReferenceIndex {
   public void clear() {
     symbolOccurrenceRepository.clear();
     locationRepository.clear();
+    referenceSymbolInterner.clear();
   }
 
   /**
@@ -282,14 +333,13 @@ public class ReferenceIndex {
                                                   String symbolName, Range range) {
     var symbolNameCanonical = stringInterner.intern(symbolName.toLowerCase(Locale.ENGLISH));
 
-    var symbol = Symbol.builder()
+    var symbol = referenceSymbolInterner.intern(Symbol.builder()
       .mdoRef(mdoRef)
       .moduleType(moduleType)
       .scopeName("")
       .symbolKind(SymbolKind.Method)
       .symbolName(symbolNameCanonical)
-      .build()
-      .intern();
+      .build());
 
     return SymbolOccurrence.of(OccurrenceType.REFERENCE, symbol, uri, range);
   }
@@ -312,14 +362,13 @@ public class ReferenceIndex {
       ModuleSymbol.nameOf(mdoRef, moduleType).toLowerCase(Locale.ENGLISH)
     );
 
-    var symbol = Symbol.builder()
+    var symbol = referenceSymbolInterner.intern(Symbol.builder()
       .mdoRef(mdoRef)
       .moduleType(moduleType)
       .scopeName("")
       .symbolKind(SymbolKind.Module)
       .symbolName(symbolName)
-      .build()
-      .intern();
+      .build());
 
     return SymbolOccurrence.of(OccurrenceType.REFERENCE, symbol, uri, range);
   }
@@ -344,19 +393,45 @@ public class ReferenceIndex {
                                                 String variableName,
                                                 Range range,
                                                 OccurrenceType occurrenceType) {
+    var symbol = variableSymbol(mdoRef, moduleType, methodName, variableName);
+    return variableOccurrence(uri, symbol, range, occurrenceType, referenceSymbolInterner);
+  }
+
+  /**
+   * Построить ключ переменной с каноническими именами метода и переменной.
+   *
+   * @param mdoRef идентификатор объекта метаданных модуля.
+   * @param moduleType тип модуля.
+   * @param methodName имя метода либо пустая строка для переменной модуля.
+   * @param variableName имя переменной.
+   * @return ключ переменной до интернирования.
+   */
+  Symbol variableSymbol(String mdoRef, ModuleType moduleType, String methodName, String variableName) {
     var methodNameCanonical = stringInterner.intern(methodName.toLowerCase(Locale.ENGLISH));
     var variableNameCanonical = stringInterner.intern(variableName.toLowerCase(Locale.ENGLISH));
 
-    var symbol = Symbol.builder()
+    return Symbol.builder()
       .mdoRef(mdoRef)
       .moduleType(moduleType)
       .scopeName(methodNameCanonical)
       .symbolKind(SymbolKind.Variable)
       .symbolName(variableNameCanonical)
-      .build()
-      .intern();
+      .build();
+  }
 
-    return SymbolOccurrence.of(occurrenceType, symbol, uri, range);
+  /**
+   * Построить вхождение переменной с канонизацией ключа в заданном интернере.
+   *
+   * @param uri URI документа обращения.
+   * @param symbol ключ переменной.
+   * @param range диапазон обращения.
+   * @param occurrenceType вид обращения.
+   * @param symbolInterner интернер ключей, время жизни которого задаёт вызывающий код.
+   * @return вхождение с каноническим ключом.
+   */
+  SymbolOccurrence variableOccurrence(URI uri, Symbol symbol, Range range, OccurrenceType occurrenceType,
+                                     GenericInterner<Symbol> symbolInterner) {
+    return SymbolOccurrence.of(occurrenceType, symbolInterner.intern(symbol), uri, range);
   }
 
   /**
@@ -379,14 +454,13 @@ public class ReferenceIndex {
                                                   OccurrenceType occurrenceType) {
     var nameCanonical = stringInterner.intern(name.toLowerCase(Locale.ENGLISH));
 
-    var symbol = Symbol.builder()
+    var symbol = referenceSymbolInterner.intern(Symbol.builder()
       .mdoRef(mdoRef)
       .moduleType(moduleType)
       .scopeName(SELF_MEMBER_SCOPE)
       .symbolKind(symbolKind)
       .symbolName(nameCanonical)
-      .build()
-      .intern();
+      .build());
 
     return SymbolOccurrence.of(occurrenceType, symbol, uri, range);
   }
@@ -408,12 +482,12 @@ public class ReferenceIndex {
     }
 
     return getSourceDefinedSymbol(serverContext, symbolOccurrence.symbol())
-      .map((SourceDefinedSymbol symbol) -> {
-        var from = getFromSymbol(serverContext, symbolOccurrence);
-        var range = symbolOccurrence.range();
-        var occurrenceType = symbolOccurrence.occurrenceType();
-        return new Reference(from, symbol, uri, range, occurrenceType);
-      })
+      .flatMap((SourceDefinedSymbol symbol) -> getFromSymbol(serverContext, symbolOccurrence)
+        .map((SourceDefinedSymbol from) -> {
+          var range = symbolOccurrence.range();
+          var occurrenceType = symbolOccurrence.occurrenceType();
+          return new Reference(from, symbol, uri, range, occurrenceType);
+        }))
       .filter(ReferenceAccessibility::isAccessible);
   }
 
@@ -431,12 +505,12 @@ public class ReferenceIndex {
     }
     return selfMemberResolver
       .resolveSelfMember(document, occurrence.symbol().symbolKind(), occurrence.symbol().symbolName())
-      .map(memberSymbol -> new Reference(
-        getFromSymbol(serverContext, occurrence),
+      .flatMap(memberSymbol -> getFromSymbol(serverContext, occurrence).map((SourceDefinedSymbol from) -> new Reference(
+        from,
         memberSymbol,
         occurrence.uri(),
         occurrence.range(),
-        occurrence.occurrenceType()));
+        occurrence.occurrenceType())));
   }
 
   private static Optional<SourceDefinedSymbol> getSourceDefinedSymbol(ServerContext serverContext, Symbol symbolEntity) {
@@ -450,8 +524,11 @@ public class ReferenceIndex {
       return maybeDocument
         .map(DocumentContext::getSymbolTree)
         .flatMap(symbolTree -> symbolTree.getMethodSymbol(symbolEntity.scopeName())
-          .flatMap(method -> symbolTree.getVariableSymbol(symbolName, method))
-          .or(() -> symbolTree.getVariableSymbol(symbolName, symbolTree.getModule())));
+          // Из метода видны не все переменные модуля: созданная присваиванием в теле модуля
+          // живёт в нём одном.
+          .map(method -> symbolTree.getVariableSymbol(symbolName, method)
+            .or(() -> symbolTree.getModuleVariableVisibleFromMethods(symbolName)))
+          .orElseGet(() -> symbolTree.getVariableSymbol(symbolName, symbolTree.getModule())));
     }
 
     if (symbolEntity.symbolKind() == SymbolKind.Module) {
@@ -465,14 +542,15 @@ public class ReferenceIndex {
       .flatMap(symbolTree -> symbolTree.getMethodSymbol(symbolName));
   }
 
-  private static SourceDefinedSymbol getFromSymbol(ServerContext serverContext, SymbolOccurrence symbolOccurrence) {
+  private static Optional<SourceDefinedSymbol> getFromSymbol(ServerContext serverContext,
+                                                            SymbolOccurrence symbolOccurrence) {
     var uri = symbolOccurrence.uri();
     var position = symbolOccurrence.startPosition();
 
+    // Вхождение могло попасть в снимок запроса до удаления документа и очистки индекса.
     return Optional.ofNullable(serverContext.getDocumentNoLock(uri))
       .map(DocumentContext::getSymbolTree)
-      .map(symbolTree -> symbolTree.getSymbolAtPosition(position))
-      .orElseThrow();
+      .map(symbolTree -> symbolTree.getSymbolAtPosition(position));
   }
 
 }

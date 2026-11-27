@@ -50,8 +50,11 @@ import com.github._1c_syntax.bsl.languageserver.types.model.Availability;
 import com.github._1c_syntax.bsl.languageserver.types.model.BilingualString;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberKind;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeKind;
+import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.util.ArrayList;
@@ -107,6 +110,53 @@ class BslContextPlatformTypesProviderTest {
     assertThat(decl.name().en()).isEqualTo("String");
     assertThat(decl.name().ru()).isEqualTo("Строка");
     assertThat(decl.members()).isEmpty();
+  }
+
+  @Test
+  void homonymousTypesHaveDistinctKeysAndPreserveReferencedIdentity() {
+    for (var reversed : List.of(false, true)) {
+      var ordinary = PlatformContextType.builder()
+        .name(new ContextName("ЭлементыФормы", "Controls"))
+        .properties(List.of()).methods(List.of()).events(List.of()).constructors(List.of())
+        .availabilities(List.of(com.github._1c_syntax.bsl.context.api.Availability.THICK_CLIENT)).build();
+      var managed = PlatformContextType.builder()
+        .name(new ContextName("ЭлементыФормы", "FormItems"))
+        .properties(List.of()).methods(List.of()).events(List.of()).constructors(List.of())
+        .availabilities(List.of(com.github._1c_syntax.bsl.context.api.Availability.THIN_CLIENT)).build();
+      var children = PlatformContextProperty.builder()
+        .name(new ContextName("ПодчиненныеЭлементы", "ChildItems"))
+        .rawTypes(List.of("ЭлементыФормы")).availabilities(List.of()).build();
+      var group = PlatformContextType.builder()
+        .name(new ContextName("ГруппаФормы", "FormGroup"))
+        .properties(new ArrayList<>(List.of(children)))
+        .methods(List.of()).events(List.of()).constructors(List.of()).build();
+      var controls = PlatformContextProperty.builder()
+        .name(new ContextName("ЭлементыФормы", "Controls"))
+        .rawTypes(List.of("ЭлементыФормы")).availabilities(List.of()).build();
+      var form = PlatformContextType.builder()
+        .name(new ContextName("Форма", "Form"))
+        .properties(new ArrayList<>(List.of(controls)))
+        .methods(List.of()).events(List.of()).constructors(List.of()).build();
+      var provider = reversed ? providerOf(group, managed, ordinary, form) : providerOf(form, ordinary, managed, group);
+
+      var types = new BslContextPlatformTypesProvider(holderOf(provider)).getTypes();
+
+      assertThat(types).extracting(TypePackProvider.TypeDecl::qualifiedName)
+        .containsExactlyInAnyOrder("Controls", "FormItems", "ГруппаФормы", "Форма");
+      assertThat(types.stream().filter(type -> type.qualifiedName().equals("FormItems")).findFirst().orElseThrow())
+        .satisfies(type -> {
+          assertThat(type.name().ru()).isEqualTo("ЭлементыФормы");
+          assertThat(type.metadata().availabilities()).containsExactly(Availability.THIN_CLIENT);
+        });
+      var groupType = types.stream().filter(type -> type.qualifiedName().equals("ГруппаФормы"))
+        .findFirst().orElseThrow();
+      assertThat(groupType.members()).singleElement().satisfies(member ->
+        assertThat(member.returnTypes().refs()).extracting(ref -> ref.qualifiedName()).containsExactly("FormItems"));
+      var formType = types.stream().filter(type -> type.qualifiedName().equals("Форма"))
+        .findFirst().orElseThrow();
+      assertThat(formType.members()).singleElement().satisfies(member ->
+        assertThat(member.returnTypes().refs()).extracting(ref -> ref.qualifiedName()).containsExactly("Controls"));
+    }
   }
 
   @Test
@@ -327,6 +377,26 @@ class BslContextPlatformTypesProviderTest {
     assertThat(decl.members()).hasSize(1);
     assertThat(decl.members().iterator().next().returnType().qualifiedName())
       .isEqualTo("Картинка");
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"", "String"})
+  void enumOfStringsReturnsThePrimitiveType(String valueTypeAlias) {
+    var stringType = primitive("Строка", "String");
+    var symbols = PlatformContextEnum.builder()
+      .name(new ContextName("Символы", "Chars"))
+      .values(List.of(new PlatformContextEnumValue(new ContextName("ПС", "LF"))))
+      .valueType(new ContextName("Строка", valueTypeAlias))
+      .build();
+    var provider = mock(ContextProvider.class);
+    when(provider.getContexts()).thenReturn(List.of(symbols, stringType));
+
+    var types = new BslContextPlatformTypesProvider(holderOf(provider)).getTypes();
+
+    assertThat(types.stream().filter(type -> type.qualifiedName().equals("Символы")).findFirst().orElseThrow()
+      .members()).singleElement()
+      .satisfies(symbol -> assertThat(symbol.returnTypes().refs())
+        .containsExactly(new TypeRef(TypeKind.PRIMITIVE, "Строка")));
   }
 
   @Test

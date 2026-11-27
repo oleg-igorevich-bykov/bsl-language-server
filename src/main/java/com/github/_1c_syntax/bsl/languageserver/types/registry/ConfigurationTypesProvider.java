@@ -35,6 +35,7 @@ import com.github._1c_syntax.bsl.languageserver.types.model.BilingualString;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberKind;
 import com.github._1c_syntax.bsl.languageserver.types.model.MemberSource;
+import com.github._1c_syntax.bsl.languageserver.types.model.SignatureDescriptor;
 import com.github._1c_syntax.bsl.languageserver.types.model.TypeRef;
 import com.github._1c_syntax.bsl.mdclasses.CF;
 import com.github._1c_syntax.bsl.mdo.Attribute;
@@ -44,6 +45,7 @@ import com.github._1c_syntax.bsl.mdo.Catalog;
 import com.github._1c_syntax.bsl.mdo.ChartOfAccounts;
 import com.github._1c_syntax.bsl.mdo.ChartOfCalculationTypes;
 import com.github._1c_syntax.bsl.mdo.CommonAttribute;
+import com.github._1c_syntax.bsl.mdo.Constant;
 import com.github._1c_syntax.bsl.mdo.DefinedType;
 import com.github._1c_syntax.bsl.mdo.DocumentJournal;
 import com.github._1c_syntax.bsl.mdo.Enum;
@@ -63,6 +65,7 @@ import org.springframework.context.event.EventListener;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.core.task.AsyncTaskExecutor;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -97,15 +100,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Регистрация идемпотентна и подписана на {@link WorkspaceAddedEvent}: к этому моменту
  * {@code configurationRoot} у контекста уже установлен — {@code addWorkspace} подхватывает его
  * из workspace-scoped конфигурации (см. {@code ServerContextProvider#addWorkspace}), поэтому
- * вызывающему достаточно обновить конфигурацию до {@code addWorkspace}. Деревья символов на
- * этот момент ещё не строились: в LSP публикация {@code .bsl}-файлов идёт только после
- * клиентского {@code initialized}, в CLI/MCP наполнение контекста ({@code populateContext})
- * выполняется уже после {@code addWorkspace}.
+ * вызывающему достаточно обновить конфигурацию до {@code addWorkspace}.
  * <p>
- * Порядок среди слушателей {@link WorkspaceAddedEvent} задан явно
- * ({@link Ordered#HIGHEST_PRECEDENCE}): Spring вызывает их последовательно на одном потоке,
- * а {@code OScriptLibraryIndex} делает полный обход дерева workspace'а (на больших проектах
- * это секунды). От регистрации типов он не зависит, поэтому ждать его незачем.
+ * Обработчик события асинхронный: чтение метаданных и регистрация на большой конфигурации —
+ * десятки секунд, и поток, добавивший рабочую область, их не ждёт. До конца попытки регистрации
+ * — при любом её исходе — {@link ServerContext} считает рабочую область готовящейся: наполнение
+ * контекста ({@code populateContext}) этого дожидается, а документы, заведённые раньше, по
+ * окончании подготовки перепривязываются к конфигурации — с деревом символов, построенным заново.
+ * <p>
+ * Порядок среди слушателей {@link WorkspaceAddedEvent} задан явно: регистрация запускается
+ * сразу после того, как контекст отметил начало подготовки ({@link Ordered#HIGHEST_PRECEDENCE}),
+ * и не ждёт остальных слушателей — {@code OScriptLibraryIndex} обходит всё дерево workspace'а.
  */
 @Component
 @WorkspaceScope
@@ -194,14 +199,26 @@ public class ConfigurationTypesProvider {
   private final AtomicBoolean registered = new AtomicBoolean(false);
 
   /**
-   * Регистрирует типы конфигурации текущего workspace'а (см. {@link #tryRegister()}).
+   * Регистрирует типы конфигурации текущего workspace'а (см. {@link #tryRegister()}) — в фоне
+   * — и заканчивает подготовку его контекста при любом исходе регистрации.
+   * <p>
+   * Контекст берётся до регистрации: снятие рабочей области, пришедшее за это время, убирает
+   * его из провайдера, а ждёт при этом как раз конца подготовки.
    *
    * @param event событие добавления workspace'а.
    */
+  @Async("asyncEventListenerExecutor")
   @EventListener
-  @Order(Ordered.HIGHEST_PRECEDENCE)
+  @Order(Ordered.HIGHEST_PRECEDENCE + 1)
   public void handleEvent(WorkspaceAddedEvent event) {
-    tryRegister();
+    var serverContext = serverContextProvider.getAllContexts().get(event.getWorkspaceUri());
+    try {
+      tryRegister();
+    } finally {
+      if (serverContext != null) {
+        serverContext.finishPreparation();
+      }
+    }
   }
 
   /**
@@ -227,7 +244,8 @@ public class ConfigurationTypesProvider {
       return null;
     }
     // workspaceUri установлен всегда: tryRegister зовётся только из обработчика
-    // WorkspaceAddedEvent, а событие публикуется под workspace-контекстом.
+    // WorkspaceAddedEvent, событие публикуется под workspace-контекстом, а исполнитель
+    // асинхронных обработчиков переносит его в свой поток.
     var workspaceUri = WorkspaceContextHolder.get();
     var serverContext = serverContextProvider.getAllContexts().get(workspaceUri);
     if (serverContext == null) {
@@ -245,16 +263,21 @@ public class ConfigurationTypesProvider {
       return null;
     });
 
-    if (serverContext.getConfiguration().isEmpty() || !registered.compareAndSet(false, true)) {
+    // Регистрации нужны настоящие метаданные, а getConfiguration(), пока рабочая область
+    // готовится, отвечает пустой конфигурацией.
+    var cf = serverContext.awaitConfiguration();
+    if (cf.isEmpty() || !registered.compareAndSet(false, true)) {
       return null;
     }
-    var cf = serverContext.getConfiguration();
     var children = cf.getChildrenByMdoRef().values();
     LOGGER.debug("ConfigurationTypesProvider[{}]: registering {} MD objects",
       workspaceUri, children.size());
+    var startedAt = System.nanoTime();
     platformTypesWarmup.join();
     register(cf, children, serverContext.getScriptVariantLanguage());
     serviceModuleEventRegistrar.register(children);
+    LOGGER.info("Configuration types of {} registered in {} ms: {} metadata objects",
+      serverContext.getConfigurationRoot(), (System.nanoTime() - startedAt) / 1_000_000, children.size());
     return serverContext;
   }
 
@@ -358,12 +381,27 @@ public class ConfigurationTypesProvider {
 
     registerObjectAndRefTypes(md, mdoType, name, fullName, commonAttributes);
     registerSpecializationsAndExpansions(md, ref, name, fullName);
+    if (md instanceof Constant constant) {
+      registerConstantGetter(ref, constant);
+    }
     registerCollectionAliases(ref, managerNames, groupRu, groupEn, name);
 
     collectionMembersByType
       .computeIfAbsent(mdoType, k -> new ArrayList<>())
-      .add(MemberDescriptor.property(name, ref));
+      .add(MemberDescriptor.property(name, ref).withBilingualName(BilingualString.of(name, name)));
     return true;
+  }
+
+  private void registerConstantGetter(TypeRef manager, Constant constant) {
+    // Источник добавляется после специализаций: описание платформы имеет приоритет.
+    typeRegistry.registerMemberSource(manager, () -> {
+      var value = ValueTypes.resolve(typeRegistry, constant.getValueType());
+      var signature = new SignatureDescriptor(List.of(), value, BilingualString.EMPTY);
+      return List.of(MemberDescriptor.method("Получить", List.of(signature))
+        .withReturnTypes(value)
+        .withBilingualName(BilingualString.of("Получить", "Get"))
+        .withStandardLibrary(true));
+    }, FileType.BSL);
   }
 
   private record ManagerNames(String ru, @Nullable String en) {
@@ -414,13 +452,11 @@ public class ConfigurationTypesProvider {
     if (!collectionAliasRu.equals(managerNames.ru())) {
       typeRegistry.registerConfigurationTypeAlias(collectionAliasRu, ref);
     }
-    globalScopeProvider.registerConfigurationQualifiedName(collectionAliasRu);
     if (!groupEn.equals(groupRu)) {
       var collectionAliasEn = groupEn + "." + name;
       if (!collectionAliasEn.equals(managerNames.ru()) && !collectionAliasEn.equals(managerNames.en())) {
         typeRegistry.registerConfigurationTypeAlias(collectionAliasEn, ref);
       }
-      globalScopeProvider.registerConfigurationQualifiedName(collectionAliasEn);
     }
   }
 
@@ -659,7 +695,7 @@ public class ConfigurationTypesProvider {
       // только из членов объектного типа — читать их из её ленивого источника нельзя.
       formDataTypesRegistrar.registerTabularSectionData(collRef, columnSource);
 
-      tsMembers.add(MemberDescriptor.property(tsName, collRef));
+      tsMembers.add(MemberDescriptor.property(tsName, collRef).withBilingualName(BilingualString.of(tsName, tsName)));
     }
     if (!tsMembers.isEmpty()) {
       var immutableTs = List.copyOf(tsMembers);
@@ -829,9 +865,10 @@ public class ConfigurationTypesProvider {
     var refType = typeRegistry.resolve(familyCore + "Ссылка." + mdName).orElse(null);
     var members = valueNames.stream()
       .distinct()
-      .map(valueName -> refType == null
+      .map(valueName -> (refType == null
         ? MemberDescriptor.property(valueName)
         : MemberDescriptor.property(valueName, refType))
+        .withBilingualName(BilingualString.of(valueName, valueName)))
       .toList();
     // В отличие от значений перечислений (placeholder generic-члена менеджера), у менеджеров
     // справочников/планов нет placeholder'а под предопределённые — регистрируем members напрямую.

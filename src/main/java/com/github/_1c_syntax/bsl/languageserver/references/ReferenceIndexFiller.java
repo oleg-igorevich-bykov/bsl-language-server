@@ -23,7 +23,9 @@ package com.github._1c_syntax.bsl.languageserver.references;
 
 import com.github._1c_syntax.bsl.languageserver.configuration.LanguageServerConfiguration;
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
+import com.github._1c_syntax.bsl.languageserver.context.DocumentState;
 import com.github._1c_syntax.bsl.languageserver.context.events.ConfigurationTypesRegisteredEvent;
+import com.github._1c_syntax.bsl.languageserver.context.events.DocumentContextConfigurationBindingChangedEvent;
 import com.github._1c_syntax.bsl.languageserver.context.events.DocumentContextContentChangedEvent;
 import com.github._1c_syntax.bsl.languageserver.context.events.ServerContextDocumentRemovedEvent;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.ConstructorSymbol;
@@ -32,6 +34,7 @@ import com.github._1c_syntax.bsl.languageserver.context.symbol.SourceDefinedSymb
 import com.github._1c_syntax.bsl.languageserver.context.symbol.SymbolTree;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.VariableSymbol;
 import com.github._1c_syntax.bsl.languageserver.references.model.OccurrenceType;
+import com.github._1c_syntax.bsl.languageserver.references.model.Symbol;
 import com.github._1c_syntax.bsl.languageserver.references.model.SymbolOccurrence;
 import com.github._1c_syntax.bsl.languageserver.types.oscript.OScriptLibraryIndex;
 import com.github._1c_syntax.bsl.languageserver.types.registry.GlobalScopeProvider;
@@ -48,6 +51,7 @@ import com.github._1c_syntax.bsl.mdo.MD;
 import com.github._1c_syntax.bsl.parser.BSLParser;
 import com.github._1c_syntax.bsl.parser.BSLParserBaseVisitor;
 import com.github._1c_syntax.bsl.types.ModuleType;
+import com.github._1c_syntax.utils.GenericInterner;
 import lombok.RequiredArgsConstructor;
 import org.antlr.v4.runtime.ParserRuleContext;
 import org.antlr.v4.runtime.Token;
@@ -120,6 +124,15 @@ public class ReferenceIndexFiller {
     fill(documentContext);
   }
 
+  // Вхождения документа записаны под его ссылкой на объект метаданных и типом модуля, а
+  // разрешение обращений опирается на них же. Порядок тот же, что у правки: после
+  // регистрации членов модуля.
+  @Order(200)
+  @EventListener
+  public void handleEvent(DocumentContextConfigurationBindingChangedEvent event) {
+    fill(event.getSource());
+  }
+
   /**
    * Обрабатывает событие удаления документа из контекста сервера.
    * <p>
@@ -154,17 +167,33 @@ public class ReferenceIndexFiller {
    * конфигурации), самих self-членов ещё не проиндексировал — здесь их подхватываем, чем
    * и обеспечивается обещанное {@code SelfMemberResolverImpl}/{@code ReferenceIndex}
    * восстановление подсветки/резолва. Перебираем только уже наполненные документы с
-   * self-типом; при обычном порядке (типы регистрируются раньше {@code didOpen}) наполненных
-   * документов на этот момент ещё нет — обработчик вхолостую.
+   * self-типом.
+   * <p>
+   * Типы регистрируются в фоне, и к концу регистрации документы уже могут быть наполнены, а
+   * часть из них — и освобождена. Документ с текстом наполняется заново под своей блокировкой
+   * на чтение; у освобождённого снимается отметка о наполнении, чтобы следующий разбор, даже
+   * того же текста, наполнил его заново: перечитывать файл ради одних ссылок здесь не стоит.
    *
    * @param event событие успешной регистрации конфигурационных типов.
    */
   @EventListener
   public void handleEvent(ConfigurationTypesRegisteredEvent event) {
-    for (var documentContext : event.getSource().getDocuments().values()) {
-      if (filled.contains(documentContext.getUri())
-        && globalScopeProvider.moduleTypeRefByUri(documentContext.getUri()).isPresent()) {
-        fill(documentContext);
+    var serverContext = event.getSource();
+    for (var documentContext : serverContext.getDocuments().values()) {
+      var uri = documentContext.getUri();
+      if (!filled.contains(uri) || globalScopeProvider.moduleTypeRefByUri(uri).isEmpty()) {
+        continue;
+      }
+      var lock = serverContext.getDocumentLock(uri);
+      lock.readLock().lock();
+      try {
+        if (serverContext.getDocumentState(documentContext) == DocumentState.WITH_CONTENT) {
+          fill(documentContext);
+        } else {
+          filled.remove(uri);
+        }
+      } finally {
+        lock.readLock().unlock();
       }
     }
   }
@@ -209,9 +238,8 @@ public class ReferenceIndexFiller {
       batch.add(index.moduleReferenceOccurrence(uri, mdoRef, moduleType, range));
     }
 
-    void addVariableUsage(URI uri, String mdoRef, ModuleType moduleType, String methodName,
-                          String variableName, Range range, OccurrenceType occurrenceType) {
-      batch.add(index.variableOccurrence(uri, mdoRef, moduleType, methodName, variableName, range, occurrenceType));
+    void addVariableUsage(SymbolOccurrence occurrence) {
+      batch.add(occurrence);
     }
 
     void addSelfMemberUsage(URI uri, String mdoRef, ModuleType moduleType, SymbolKind symbolKind,
@@ -226,8 +254,6 @@ public class ReferenceIndexFiller {
 
     private final DocumentContext documentContext;
     private final BatchingSink sink;
-    private final ModuleReference.ParsedAccessors parsedAccessors =
-      ModuleReference.parseAccessors(configuration.getReferencesOptions().getCommonModuleAccessors());
     private Set<String> commonModuleMdoRefFromSubParams = Collections.emptySet();
 
     @Override
@@ -529,7 +555,8 @@ public class ReferenceIndexFiller {
       BSLParser.@Nullable AccessCallContext trailingCall
     ) {
       ModuleReference.extractMethodCallOnGetterModule(
-          baseIdentifier, baseGlobalCall, modifiers, trailingCall, parsedAccessors)
+          baseIdentifier, baseGlobalCall, modifiers, trailingCall,
+          configuration.getReferencesOptions().getModuleAccessors())
         .ifPresent(call -> documentContext.getServerContext()
           .findCommonModule(call.moduleName())
           .ifPresent(commonModule -> addMethodCall(
@@ -594,19 +621,16 @@ public class ReferenceIndexFiller {
 
     private final DocumentContext documentContext;
     private final BatchingSink sink;
-    private final ModuleReference.ParsedAccessors parsedAccessors;
     @SuppressWarnings("NullAway.Init")
     private @Nullable SourceDefinedSymbol currentScope;
     private final Map<String, String> variableToCommonModuleMap = new HashMap<>();
     /** variable name (lowercase) → URI .os-файла library-класса, на экземпляр которого переменная инициализирована. */
     private final Map<String, String> variableToLibraryClassUriMap = new HashMap<>();
+    private @Nullable GenericInterner<Symbol> localVariableInterner;
 
     private VariableSymbolReferenceIndexFinder(DocumentContext documentContext, BatchingSink sink) {
       this.documentContext = documentContext;
       this.sink = sink;
-      this.parsedAccessors = ModuleReference.parseAccessors(
-        configuration.getReferencesOptions().getCommonModuleAccessors()
-      );
     }
 
     @Override
@@ -647,21 +671,17 @@ public class ReferenceIndexFiller {
     }
 
     /**
-     * Очищает mappings для локальных переменных, сохраняя модульные.
+     * Очищает mappings при входе в метод, сохраняя только переменные модуля, видимые из
+     * методов: объявленные {@code Перем}. Переменная, созданная присваиванием в теле модуля,
+     * из метода не видна, и одноимённое обращение в методе к её объекту не относится.
      */
     private void clearLocalVariableMappings() {
       var moduleSymbolTree = documentContext.getSymbolTree();
-      var module = moduleSymbolTree.getModule();
-
-      // Оставляем только те mappings, которые соответствуют модульным переменным
-      variableToCommonModuleMap.keySet().removeIf((String variableKey) -> {
-        // Ищем переменную на уровне модуля
-        var moduleVariable = moduleSymbolTree.getVariableSymbol(variableKey, module);
-        // Если переменной нет на уровне модуля - это локальная переменная, удаляем mapping
-        return moduleVariable.isEmpty();
-      });
+      variableToCommonModuleMap.keySet().removeIf((String variableKey) ->
+        moduleSymbolTree.getModuleVariableVisibleFromMethods(variableKey).isEmpty()
+      );
       variableToLibraryClassUriMap.keySet().removeIf((String variableKey) ->
-        moduleSymbolTree.getVariableSymbol(variableKey, module).isEmpty()
+        moduleSymbolTree.getModuleVariableVisibleFromMethods(variableKey).isEmpty()
       );
     }
 
@@ -682,8 +702,10 @@ public class ReferenceIndexFiller {
         if (libClassUri != null) {
           variableToLibraryClassUriMap.put(variableKey, libClassUri);
           variableToCommonModuleMap.remove(variableKey);
-        } else if (ModuleReference.isCommonModuleExpression(expression, parsedAccessors)) {
-          var commonModuleOpt = ModuleReference.extractCommonModuleName(expression, parsedAccessors)
+        } else if (ModuleReference.isCommonModuleExpression(expression,
+          configuration.getReferencesOptions().getModuleAccessors())) {
+          var commonModuleOpt = ModuleReference.extractCommonModuleName(expression,
+              configuration.getReferencesOptions().getModuleAccessors())
             .flatMap(moduleName -> documentContext.getServerContext()
               .findCommonModule(moduleName));
           if (commonModuleOpt.isPresent()) {
@@ -715,7 +737,7 @@ public class ReferenceIndexFiller {
         return null;
       }
       var complexId = members.get(0).complexIdentifier();
-      if (complexId == null) {
+      if (complexId == null || !complexId.modifier().isEmpty()) {
         return null;
       }
       var newExpression = complexId.newExpression();
@@ -760,27 +782,17 @@ public class ReferenceIndexFiller {
       var variableName = ctx.IDENTIFIER().getText();
       var variableKey = variableName.toLowerCase(Locale.ENGLISH);
 
-      // Check if variable references a common module
-      var commonModuleMdoRef = variableToCommonModuleMap.get(variableKey);
-
-      if (commonModuleMdoRef != null) {
-        // Process method calls on the common module variable
-        // Check both modifiers and accessCall
-        if (!ctx.modifier().isEmpty()) {
-          processCommonModuleMethodCalls(ctx.modifier(), commonModuleMdoRef);
+      // Только первое звено обращается к исходному модулю: остальные — к результату обращения.
+      var modifiers = ctx.modifier();
+      var accessCall = modifiers.isEmpty() ? ctx.accessCall() : modifiers.getFirst().accessCall();
+      if (accessCall != null) {
+        var commonModuleMdoRef = variableToCommonModuleMap.get(variableKey);
+        if (commonModuleMdoRef != null) {
+          processCommonModuleAccessCall(accessCall, commonModuleMdoRef);
         }
-        if (ctx.accessCall() != null) {
-          processCommonModuleAccessCall(ctx.accessCall(), commonModuleMdoRef);
-        }
-      }
-
-      var libClassUri = variableToLibraryClassUriMap.get(variableKey);
-      if (libClassUri != null) {
-        if (!ctx.modifier().isEmpty()) {
-          processLibraryClassMethodCalls(ctx.modifier(), libClassUri);
-        }
-        if (ctx.accessCall() != null) {
-          processLibraryClassAccessCall(ctx.accessCall(), libClassUri);
+        var libClassUri = variableToLibraryClassUriMap.get(variableKey);
+        if (libClassUri != null) {
+          processLibraryClassAccessCall(accessCall, libClassUri);
         }
       }
 
@@ -870,15 +882,14 @@ public class ReferenceIndexFiller {
     }
 
     private Optional<VariableSymbol> findVariableSymbol(String variableName) {
-      var variableSymbol = documentContext.getSymbolTree()
-        .getVariableSymbol(variableName, currentScope);
-
-      if (variableSymbol.isPresent()) {
-        return variableSymbol;
+      var symbolTree = documentContext.getSymbolTree();
+      if (currentScope instanceof MethodSymbol method) {
+        var inMethod = symbolTree.getVariableSymbol(variableName, method);
+        // Из метода видны не все переменные модуля: созданная присваиванием в теле модуля
+        // живёт в нём одном.
+        return inMethod.isPresent() ? inMethod : symbolTree.getModuleVariableVisibleFromMethods(variableName);
       }
-
-      return documentContext.getSymbolTree()
-        .getVariableSymbol(variableName, documentContext.getSymbolTree().getModule());
+      return symbolTree.getVariableSymbol(variableName, symbolTree.getModule());
     }
 
     private boolean notVariableInitialization(BSLParser.LValueContext ctx, VariableSymbol variableSymbol) {
@@ -908,20 +919,34 @@ public class ReferenceIndexFiller {
         methodName = methodSymbol.get().getName();
       }
 
-      sink.addVariableUsage(
-        documentContext.getUri(),
-        documentContext.getMdoRef(),
-        documentContext.getModuleType(),
-        methodName,
-        variableName,
-        range,
-        usage ? OccurrenceType.REFERENCE : OccurrenceType.DEFINITION
-      );
+      sink.addVariableUsage(variableOccurrence(methodName, variableName, range,
+        usage ? OccurrenceType.REFERENCE : OccurrenceType.DEFINITION));
+    }
+
+    /** Канонизирует локальные ключи в пределах одного обхода переменных документа. */
+    private SymbolOccurrence variableOccurrence(String methodName, String variableName, Range range,
+                                                OccurrenceType occurrenceType) {
+      var uri = documentContext.getUri();
+      var mdoRef = documentContext.getMdoRef();
+      var moduleType = documentContext.getModuleType();
+      if (methodName.isEmpty()) {
+        return index.variableOccurrence(uri, mdoRef, moduleType, methodName, variableName, range, occurrenceType);
+      }
+
+      var interner = localVariableInterner;
+      if (interner == null) {
+        interner = new GenericInterner<>();
+        index.getLocalVariableKeys(uri).forEach(interner::intern);
+        localVariableInterner = interner;
+      }
+
+      var symbol = index.variableSymbol(mdoRef, moduleType, methodName, variableName);
+      return index.variableOccurrence(uri, symbol, range, occurrenceType, interner);
     }
 
     private void processCommonModuleMethodCalls(List<? extends BSLParser.ModifierContext> modifiers, String mdoRef) {
-      for (var modifier : modifiers) {
-        var accessCall = modifier.accessCall();
+      if (!modifiers.isEmpty()) {
+        var accessCall = modifiers.getFirst().accessCall();
         if (accessCall != null) {
           processCommonModuleAccessCall(accessCall, mdoRef);
         }
@@ -945,8 +970,8 @@ public class ReferenceIndexFiller {
     }
 
     private void processLibraryClassMethodCalls(List<? extends BSLParser.ModifierContext> modifiers, String libClassUri) {
-      for (var modifier : modifiers) {
-        var accessCall = modifier.accessCall();
+      if (!modifiers.isEmpty()) {
+        var accessCall = modifiers.getFirst().accessCall();
         if (accessCall != null) {
           processLibraryClassAccessCall(accessCall, libClassUri);
         }

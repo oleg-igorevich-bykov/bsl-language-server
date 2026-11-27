@@ -24,6 +24,7 @@ package com.github._1c_syntax.bsl.languageserver.types.registry;
 import com.github._1c_syntax.bsl.context.api.ContextNames;
 import com.github._1c_syntax.bsl.languageserver.context.FileType;
 import com.github._1c_syntax.bsl.languageserver.context.DocumentContext;
+import com.github._1c_syntax.bsl.languageserver.context.events.DocumentContextConfigurationBindingChangedEvent;
 import com.github._1c_syntax.bsl.languageserver.context.events.DocumentContextContentChangedEvent;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.MethodSymbol;
 import com.github._1c_syntax.bsl.languageserver.context.symbol.VariableSymbol;
@@ -108,7 +109,40 @@ public class ConfigurationModuleMembersProvider {
   @EventListener
   public void handleEvent(DocumentContextContentChangedEvent event) {
     var documentContext = event.getSource();
+    if (!event.isContentChanged() && refreshCommonModule(documentContext)) {
+      return;
+    }
     register(documentContext);
+  }
+
+  // Привязка к метаданным определяет, членами какого типа становятся методы модуля, и
+  // порядок тот же, что у правки: индексатор ссылок и индекс типов идут следом.
+  @Order(100)
+  @EventListener
+  public void handleEvent(DocumentContextConfigurationBindingChangedEvent event) {
+    register(event.getSource());
+  }
+
+  /**
+   * Освежает общий модуль, перечитанный с тем же текстом: имя и члены у него прежние, а символы
+   * из нового дерева. Члены самого модуля пересобираются по новому дереву, а член глобального
+   * контекста только получает новый символ-источник — пересобирать ради него все члены
+   * глобального контекста и индекс глобальных имён незачем.
+   *
+   * @param documentContext документ.
+   * @return {@code true}, если это уже зарегистрированный общий модуль и он освежён.
+   */
+  private boolean refreshCommonModule(DocumentContext documentContext) {
+    if (documentContext.getModuleType() != ModuleType.CommonModule) {
+      return false;
+    }
+    var ref = registeredByUri.get(documentContext.getUri());
+    if (ref == null) {
+      return false;
+    }
+    typeRegistry.refreshGlobalPropertyDeclaration(ref, documentContext.getSymbolTree().getModule());
+    typeRegistry.invalidateMembers(ref);
+    return true;
   }
 
   /**
@@ -227,7 +261,7 @@ public class ConfigurationModuleMembersProvider {
       return;
     }
 
-    typeRegistry.registerMemberSource(ref, () -> collectModuleMembers(documentContext), FileType.BSL);
+    typeRegistry.registerOwnMemberSource(ref, () -> collectModuleMembers(documentContext), FileType.BSL);
     LOGGER.debug("Registered module-as-member-source for {} -> {}", documentContext.getUri(), qualifiedRu);
   }
 
@@ -255,7 +289,7 @@ public class ConfigurationModuleMembersProvider {
       return;
     }
 
-    typeRegistry.registerMemberSource(ref, () -> collectModuleMembers(documentContext), FileType.BSL);
+    typeRegistry.registerOwnMemberSource(ref, () -> collectModuleMembers(documentContext), FileType.BSL);
     LOGGER.debug("Registered form module as member source for {} -> {}",
       documentContext.getUri(), ref.qualifiedName());
   }
@@ -291,8 +325,8 @@ public class ConfigurationModuleMembersProvider {
       return;
     }
 
-    typeRegistry.registerMemberSource(ref, () -> collectModuleMembers(documentContext), FileType.BSL);
-    typeRegistry.registerMemberSource(ref, () -> commonModulePlatformMembers(ref), FileType.BSL);
+    typeRegistry.registerOwnMemberSource(ref, () -> collectModuleMembers(documentContext), FileType.BSL);
+    typeRegistry.registerOwnMemberSource(ref, () -> commonModulePlatformMembers(ref), FileType.BSL);
     LOGGER.debug("Registered common module as global property {} -> {}", documentContext.getUri(), name);
   }
 
